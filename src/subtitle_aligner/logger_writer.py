@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from subtitle_aligner.aligner import AlignmentMatch
 
 
 @dataclass
@@ -141,7 +142,8 @@ class LoggerWriter:
         Returns:
             Filename in the form ``{video_name}_{subtitle_name}.log``.
         """
-        return f"{self.video_name}_{self.subtitle_name}.log"
+        # limit char len
+        return f"{self.video_name[:20]}_{self.subtitle_name[:20]}.log"
 
     def _truncate_text(self, text: str) -> str:
         """Truncate text to a maximum length for table readability.
@@ -412,6 +414,68 @@ class LoggerWriter:
                 rows.append(parsed)
 
         return rows
+
+    @staticmethod
+    def prepare_log_data(
+        matches: list[AlignmentMatch],
+    ) -> tuple[list[LogEntry], list[LogWarning]]:
+        """Convert alignment matches to log entries and structured warnings.
+
+        Decoupled helper to clean up run_aligner's core execution flow.
+        """
+        entries: list[LogEntry] = []
+        warnings: list[LogWarning] = []
+
+        for m in matches:
+            text = m.asr_segment.text if m.asr_segment is not None else ""
+            entry = LogEntry(
+                subtitle_index=m.subtitle_index,
+                action=m.action,
+                original_start=m.original_start,
+                original_end=m.original_end,
+                new_start=m.new_start,
+                new_end=m.new_end,
+                timing_difference=m.timing_difference,
+                similarity=m.similarity,
+                text=text,
+            )
+            entries.append(entry)
+
+            sub_idx = m.subtitle_index if m.subtitle_index >= 0 else None
+
+            if m.action == "shift":
+                warnings.append(
+                    LogWarning(
+                        warning_type="shift",
+                        subtitle_index=sub_idx,
+                        description=(
+                            f"Large timing shift detected: {m.timing_difference:.2f}s"
+                        ),
+                    )
+                )
+            elif m.action == "inserted":
+                warnings.append(
+                    LogWarning(
+                        warning_type="inserted",
+                        subtitle_index=None,
+                        description=(
+                            f"ASR scene inserted at {m.new_start:.2f}s–{m.new_end:.2f}s"
+                        ),
+                    )
+                )
+            elif m.action == "keep" and 0.0 < m.similarity < 0.5:
+                warnings.append(
+                    LogWarning(
+                        warning_type="low_similarity",
+                        subtitle_index=sub_idx,
+                        description=(
+                            f"Low similarity match ({m.similarity:.2f}) "
+                            f"kept with original timing"
+                        ),
+                    )
+                )
+
+        return entries, warnings
 
     @staticmethod
     def to_csv(log_content: str, section: str) -> str:

@@ -1,4 +1,4 @@
-"""ASR transcriber — ReazonSpeech transcription with timestamp mapping.
+"""ASR transcriber — ReazonSpeech transcription with timestamp mapping and CTC character timings.
 
 Wraps the ReazonSpeech (espnet-asr) pipeline to transcribe audio segments
 and convert relative timestamps into absolute video timeline positions.
@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from reazonspeech.espnet.asr import transcribe, audio_from_path
+from reazonspeech.espnet.asr.ctc import get_timings
 
 from .text_processing import TextProcessor
 from .subtitle_writer import SubtitleWriter
@@ -22,10 +23,11 @@ class TranscriptionSegment:
     end_time: float
     text: str  # original transcribed text
     katakana: str  # phonetic Katakana representation
+    char_timings: list[float]  # Absolute timestamp for each char in text
 
 
 class ASRTranscriber:
-    """Transcribes audio segments using ReazonSpeech (espnet-asr).
+    """Transcribes audio segments using ReazonSpeech (espnet-asr) with CTC character-level timings..
 
     1. Loads the ReazonSpeech model (lazy, single instance).
     2. Transcribes each audio segment, producing timestamped text.
@@ -58,7 +60,7 @@ class ASRTranscriber:
         audio_path: str,
         offset: float = 0.0,
     ) -> list[TranscriptionSegment]:
-        """Transcribe a single audio segment and map timestamps to video time.
+        """Transcribe a single audio segment and map timestamps to video time with CTC timings.
 
         Args:
             audio_path: Path to the audio file (must be .wav).
@@ -74,11 +76,32 @@ class ASRTranscriber:
         audio = audio_from_path(audio_path)
         result = transcribe(self._model, audio)
 
+        samples = audio.waveform
+
         segments: list[TranscriptionSegment] = []
         for seg in result.segments:
             absolute_start = seg.start_seconds + offset
             absolute_end = seg.end_seconds + offset
             katakana = self._text_processor.text_to_katakana(seg.text)
+
+            # Compute CTC character timings relative to the segment
+            char_timings: list[float] = []
+            try:
+                # get_timings returns timings in audio samples
+                raw_timings = get_timings(self._model, samples, seg.text)
+                # to absolute seconds
+                char_timings = [
+                    (sample_idx / 16000.0) + offset for sample_idx in raw_timings
+                ]
+            except Exception as e:
+                # distribute timings uniformly
+                print(f"[ASR Warning] CTC alignment failed: {e}")
+                num_chars = len(seg.text)
+                if num_chars > 0:
+                    step = (absolute_end - absolute_start) / num_chars
+                    char_timings = [
+                        absolute_start + (i * step) for i in range(num_chars)
+                    ]
 
             segments.append(
                 TranscriptionSegment(
@@ -86,6 +109,7 @@ class ASRTranscriber:
                     end_time=absolute_end,
                     text=seg.text,
                     katakana=katakana,
+                    char_timings=char_timings,
                 )
             )
 

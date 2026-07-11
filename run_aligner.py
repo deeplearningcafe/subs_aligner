@@ -11,25 +11,34 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+import torch
+import numpy as np
 
-# Ensure the project root is on sys.path so the src package is importable.
 _project_root = Path(__file__).resolve().parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.subtitle_aligner.aligner import SubtitleAligner
-from src.subtitle_aligner.asr_transcriber import ASRTranscriber
-from src.subtitle_aligner.audio_segmenter import AudioSegmenter
-from src.subtitle_aligner.logger_writer import LogEntry, LogWarning, LoggerWriter
-from src.subtitle_aligner.subtitle_parser import SubtitleParser
-from src.subtitle_aligner.subtitle_writer import SubtitleWriter
+from subtitle_aligner.aligner import SubtitleAligner
+from subtitle_aligner.asr_transcriber import ASRTranscriber
+from subtitle_aligner.audio_segmenter import AudioSegmenter
+from subtitle_aligner.logger_writer import LoggerWriter
+from subtitle_aligner.subtitle_parser import SubtitleParser
+from subtitle_aligner.subtitle_writer import SubtitleWriter
+
+torch.manual_seed(46)
+np.random.seed(46)
 
 
 def detect_format(filepath: Path) -> str:
-    """Detect whether a subtitle file is SRT or VTT by its first line."""
+    """Detect whether a subtitle file is SRT, VTT, or ASS."""
+    ext = filepath.suffix.lower()
+    if ext == ".ass":
+        return "ass"
     text = filepath.read_text(encoding="utf-8-sig")
     if text.strip().upper().startswith("WEBVTT"):
         return "vtt"
+    if "[events]" in text.lower() or "[script info]" in text.lower():
+        return "ass"
     return "srt"
 
 
@@ -105,7 +114,6 @@ def main() -> None:
             )
         return
 
-    # ── Alignment mode ──────────────────────────────────────────────
     if args.align:
         if not args.video_dir or not args.subtitle_dir:
             print("Error: --video-dir and --subtitle-dir are required with --align")
@@ -124,21 +132,26 @@ def main() -> None:
         output_subtitles = _project_root / "outputs" / "subtitles"
         output_subtitles.mkdir(parents=True, exist_ok=True)
 
-        # Find video file
-        video_files = list(video_dir.glob("*.mp4"))
-        if not video_files:
-            video_files = list(video_dir.glob("*.mkv"))
-        if not video_files:
-            print("Error: No video files (.mp4/.mkv) found in --video-dir")
+        # Identify the first matching video file using lazy evaluation
+        video_extensions = {".mp4", ".mkv", ".webm"}
+        video_path = next(
+            (
+                p
+                for p in video_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in video_extensions
+            ),
+            None,
+        )
+        if not video_path:
+            print("Error: No video files found in --video-dir")
             sys.exit(1)
-        video_path = video_files[0]
 
         # Find subtitle file
         subtitle_files = []
-        for ext in ("*.srt", "*.vtt"):
+        for ext in ("*.srt", "*.vtt", "*.ass"):
             subtitle_files.extend(subtitle_dir.glob(ext))
         if not subtitle_files:
-            print(f"No .srt or .vtt files found in {subtitle_dir}")
+            print(f"No .srt, .vtt, or .ass files found in {subtitle_dir}")
             sys.exit(1)
         subtitle_path = subtitle_files[0]
 
@@ -188,79 +201,31 @@ def main() -> None:
         aligner.write_aligned(aligned_blocks, output_path, fmt=fmt)
         print(f"[Align]   -> Written aligned subtitles to {output_path}")
 
-        # Step 6: Generate log file
-        output_logs = _project_root / "outputs" / "logs"
+        # Step 6: Generate structured log file inside a folder per transcription
+        transcription_dir_name = f"{video_path.stem}_{subtitle_path.stem}"
+        transcription_dir_name = LoggerWriter._sanitize_filename(transcription_dir_name)
+
+        output_logs = _project_root / "outputs" / "logs" / transcription_dir_name
         output_logs.mkdir(parents=True, exist_ok=True)
 
-        video_base = video_path.stem
-        subtitle_base = subtitle_path.stem
-
         logger_writer = LoggerWriter(
-            video_name=video_base,
-            subtitle_name=subtitle_base,
+            video_name=video_path.stem,
+            subtitle_name=subtitle_path.stem,
             output_dir=str(output_logs),
         )
-
-        entries: list[LogEntry] = []
-        warnings: list[LogWarning] = []
-
-        for m in matches:
-            entry = LogEntry(
-                subtitle_index=m.subtitle_index,
-                action=m.action,
-                original_start=m.original_start,
-                original_end=m.original_end,
-                new_start=m.new_start,
-                new_end=m.new_end,
-                timing_difference=m.timing_difference,
-                similarity=m.similarity,
-                text=m.asr_segment.text if m.asr_segment is not None else "",
-            )
-            entries.append(entry)
-
-            # Warning: large shift
-            if m.action == "shift":
-                warnings.append(
-                    LogWarning(
-                        warning_type="shift",
-                        subtitle_index=m.subtitle_index
-                        if m.subtitle_index >= 0
-                        else None,
-                        description=(
-                            f"Large timing shift detected: {m.timing_difference:.2f}s"
-                        ),
-                    )
-                )
-
-            # Warning: inserted ASR scene
-            if m.action == "inserted":
-                warnings.append(
-                    LogWarning(
-                        warning_type="inserted",
-                        subtitle_index=None,
-                        description=(
-                            f"ASR scene inserted at {m.new_start:.2f}s–{m.new_end:.2f}s"
-                        ),
-                    )
-                )
-
-            # Warning: low similarity but kept
-            if m.action == "keep" and m.similarity < 0.5 and m.similarity > 0.0:
-                warnings.append(
-                    LogWarning(
-                        warning_type="low_similarity",
-                        subtitle_index=m.subtitle_index
-                        if m.subtitle_index >= 0
-                        else None,
-                        description=(
-                            f"Low similarity match ({m.similarity:.2f}) "
-                            f"kept with original timing"
-                        ),
-                    )
-                )
-
+        logger_writer = LoggerWriter(
+            video_name=video_path.stem,
+            subtitle_name=subtitle_path.stem,
+            output_dir=str(output_logs),
+        )
+        entries, warnings = logger_writer.prepare_log_data(matches)
         log_path = logger_writer.write_log(entries, warnings)
         print(f"[Align]   -> Written log to {log_path}")
+
+        # Step 7: Store the ASR prediction subtitles for debugging
+        asr_sub_path = output_logs / f"asr_prediction.{fmt}"
+        transcriber.write_aligned(asr_segments, asr_sub_path, fmt)
+        print(f"[Align]   -> Written ASR prediction subtitles to {asr_sub_path}")
         return
 
     # ── Subtitle processing mode ────────────────────────────────────
@@ -277,7 +242,7 @@ def main() -> None:
 
     # Find all subtitle files
     subtitle_files = []
-    for ext in ("*.srt", "*.vtt"):
+    for ext in ("*.srt", "*.vtt", "*.ass"):
         subtitle_files.extend(subtitle_dir.glob(ext))
 
     if not subtitle_files:

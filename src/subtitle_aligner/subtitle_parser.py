@@ -17,6 +17,11 @@ class SubtitleBlock:
     end_time: float
     raw_text: str
     cleaned_text: str
+    bom: bool = False
+    line_ending: str = "\n"
+    trailing_blank: bool = False
+    ass_header: list[str] | None = None
+    ass_metadata: dict[str, str] | None = None
 
 
 class SubtitleParser:
@@ -35,8 +40,6 @@ class SubtitleParser:
 
     def __init__(self) -> None:
         self._text_processor = TextProcessor()
-
-    # ── public API ──────────────────────────────────────────────────────
 
     def parse_file(self, filepath: str | Path) -> list[SubtitleBlock]:
         """
@@ -61,26 +64,28 @@ class SubtitleParser:
 
         if self._is_vtt(text):
             blocks = self._parse_vtt(text)
+        elif self._is_ass(text):
+            blocks = self._parse_ass(text)
         else:
             blocks = self._parse_srt(text)
 
         # Attach metadata to first block for round-trip writing
         if blocks:
-            blocks[0]._bom = bom  # type: ignore[attr-defined]
-            blocks[0]._line_ending = line_ending  # type: ignore[attr-defined]
+            blocks[0].bom = bom
+            blocks[0].line_ending = line_ending
             # Detect trailing blank line (file ends with double line_ending)
             le_bytes = line_ending.encode("utf-8")
-            blocks[0]._trailing_blank = raw.endswith(le_bytes + le_bytes)  # type: ignore[attr-defined]
+            blocks[0].trailing_blank = raw.endswith(le_bytes + le_bytes)
 
         return blocks
-
-    # ── format detection ────────────────────────────────────────────────
 
     @staticmethod
     def _is_vtt(text: str) -> bool:
         return text.strip().upper().startswith("WEBVTT")
 
-    # ── SRT parser ──────────────────────────────────────────────────────
+    @staticmethod
+    def _is_ass(text: str) -> bool:
+        return "[events]" in text.lower() or "[script info]" in text.lower()
 
     def _parse_srt(self, text: str) -> list[SubtitleBlock]:
         """Parse an SRT file into a list of SubtitleBlock instances."""
@@ -115,8 +120,6 @@ class SubtitleParser:
             blocks.append(SubtitleBlock(start, end, raw_text, cleaned))
 
         return blocks
-
-    # ── VTT parser ──────────────────────────────────────────────────────
 
     def _parse_vtt(self, text: str) -> list[SubtitleBlock]:
         """Parse a VTT file into a list of SubtitleBlock instances."""
@@ -171,7 +174,101 @@ class SubtitleParser:
 
         return blocks
 
-    # ── timestamp helpers ───────────────────────────────────────────────
+    def _parse_ass(self, text: str) -> list[SubtitleBlock]:
+        """Parse an ASS file into a list of SubtitleBlock instances.
+
+        Args:
+            text: Decoded text of the ASS subtitle.
+
+        Returns:
+            List of SubtitleBlock instances.
+        """
+        blocks: list[SubtitleBlock] = []
+        lines = text.splitlines()
+
+        header_lines: list[str] = []
+        is_events = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.upper() == "[EVENTS]":
+                is_events = True
+                header_lines.append(line)
+                continue
+
+            if not is_events:
+                header_lines.append(line)
+                continue
+
+            if stripped.upper().startswith("FORMAT:"):
+                header_lines.append(line)
+                continue
+
+            # Process Event lines (Dialogue or Comment)
+            match = re.match(r"^(Dialogue|Comment):\s*(.*)$", line, re.IGNORECASE)
+            if match:
+                prefix = match.group(1)
+                fields_str = match.group(2)
+                # Standard ASS has 10 fields; the last field is the Text
+                fields = fields_str.split(",", 9)
+                if len(fields) >= 10:
+                    start_str = fields[1].strip()
+                    end_str = fields[2].strip()
+                    raw_text = fields[9]
+
+                    try:
+                        start_time = self._ass_ts_to_seconds(start_str)
+                        end_time = self._ass_ts_to_seconds(end_str)
+                    except Exception:
+                        header_lines.append(line)
+                        continue
+
+                    # Map ASS line breaks to standard literal \n
+                    internal_raw = raw_text.replace(r"\N", "\n").replace(r"\n", "\n")
+                    cleaned = self._text_processor.extract_main_text(internal_raw)
+
+                    block = SubtitleBlock(start_time, end_time, internal_raw, cleaned)
+                    block.ass_metadata = {
+                        "prefix": prefix,
+                        "layer": fields[0],
+                        "style": fields[3],
+                        "name": fields[4],
+                        "margin_l": fields[5],
+                        "margin_r": fields[6],
+                        "margin_v": fields[7],
+                        "effect": fields[8],
+                    }
+                    blocks.append(block)
+                else:
+                    header_lines.append(line)
+            else:
+                header_lines.append(line)
+
+        if blocks:
+            blocks[0].ass_header = header_lines
+
+        return blocks
+
+    @staticmethod
+    def _ass_ts_to_seconds(ts: str) -> float:
+        """Convert an ASS timestamp (H:MM:SS.cs) to seconds.
+
+        Args:
+            ts: Raw ASS timestamp string.
+
+        Returns:
+            Timestamp converted to absolute seconds (float).
+        """
+        parts = ts.split(":")
+        h = int(parts[0])
+        m = int(parts[1])
+        sec_parts = parts[2].split(".")
+        s = int(sec_parts[0])
+        frac_str = sec_parts[1] if len(sec_parts) > 1 else "0"
+        # Support arbitrary length centiseconds
+        frac_str = frac_str.ljust(3, "0")[:3]
+        ms = int(frac_str)
+        return h * 3600 + m * 60 + s + ms / 1000.0
 
     @staticmethod
     def _srt_ts_to_seconds(ts: str) -> float:

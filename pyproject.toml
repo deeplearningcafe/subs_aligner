@@ -154,8 +154,8 @@ dev = ["pytest"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/subtitle_aligner"]
+[tool.setuptools]
+package-dir = { "" = "src" }
 
 [tool.uv.workspace]
 members = ["ReazonSpeech/pkg/espnet-asr"]
@@ -165,6 +165,4 @@ espnet-model-zoo = { git = "https://github.com/espnet/espnet_model_zoo", rev = "
 reazonspeech-espnet-asr = { workspace = true }
 
 [dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-]
+dev = ["pytest>=9.1.1"]
