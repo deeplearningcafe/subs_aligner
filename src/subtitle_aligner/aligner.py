@@ -68,13 +68,12 @@ class AlignmentMatch:
 class SubtitleAligner:
     """Aligns original subtitles with ASR transcription using sliding windows.
 
-    For each subtitle, searches a ±5-minute window for candidate ASR segments,
-    matches them by Katakana phonetic similarity, and applies 3-tier timing
-    adjustments.  Unmatched subtitles inherit shift offsets from neighbours.
-    Unmatched ASR segments in blank gaps are inserted as new subtitle lines.
+    Supports global phrase similarity matching and localized character-level
+    CTC alignment.
 
     Args:
-        device: Device for any computation (``"cpu"`` or ``"cuda"``).
+        device: Device for computation (cpu/cuda).
+        mode: The active alignment strategy ("local_ctc" or "original_global").
     """
 
     WINDOW_SECONDS: float = 300.0  # ±5 minutes
@@ -84,16 +83,12 @@ class SubtitleAligner:
     INSERTION_GAP_THRESHOLD: float = 2.0  # seconds: min gap edge tolerance
     MIN_ASR_DURATION: float = 1.0  # seconds: minimum ASR segment to insert
 
-    def __init__(self, device: str = "cpu") -> None:
-        """Initialize the aligner.
-
-        Args:
-            device: Device for computation (cpu/cuda).
-        """
+    def __init__(self, device: str = "cpu", mode: str = "global") -> None:
+        """Initialize the aligner."""
         self.device = device
+        self.mode = mode
         self._text_processor = TextProcessor()
-
-    # ── helpers ─────────────────────────────────────────────────────────
+        print(f"Using mode: {mode}")
 
     def _get_katakana(self, text: str) -> str:
         """Convert text to Katakana for phonetic comparison.
@@ -290,41 +285,77 @@ class SubtitleAligner:
                 return False
         return True
 
-    # ── public API ──────────────────────────────────────────────────────
+    def _create_keep_match(
+        self,
+        index: int,
+        subtitle: SubtitleBlock,
+        new_start: float,
+        new_end: float,
+        similarity: float = 0.0,
+    ) -> AlignmentMatch:
+        """Helper to construct a standardized AlignmentMatch with a keep action."""
+        return AlignmentMatch(
+            subtitle_index=index,
+            asr_segment=None,
+            similarity=similarity,
+            timing_difference=0.0,
+            action="keep",
+            original_start=subtitle.start_time,
+            original_end=subtitle.end_time,
+            new_start=new_start,
+            new_end=new_end,
+        )
 
-    def align(
+    def _apply_fallback_offset(self, subtitle: SubtitleBlock) -> tuple[float, float]:
+        """Apply fallback shift offset if the subtitle overlaps matched ASR."""
+        if (
+            self._last_shift_offset is not None
+            and self._last_shift_asr is not None
+            and self._subtitle_overlaps_matched_asr(subtitle)
+        ):
+            return (
+                subtitle.start_time + self._last_shift_offset,
+                subtitle.end_time + self._last_shift_offset,
+            )
+        return subtitle.start_time, subtitle.end_time
+
+    def _update_shift_state(
+        self,
+        action: str,
+        subtitle: SubtitleBlock,
+        best_match: TranscriptionSegment,
+        new_start: float,
+    ) -> None:
+        """Track shift state variations to resolve propagation later."""
+        if action == "shift":
+            self._last_shift_offset = new_start - subtitle.start_time
+            self._last_shift_asr = best_match
+            logger.warning(
+                f"[Aligner] Subtitle shifted by "
+                f"{abs(new_start - subtitle.start_time):.2f}s"
+            )
+
+    def _mark_asr_consumed(
+        self,
+        best_match: TranscriptionSegment,
+        asr_segments: list[TranscriptionSegment],
+    ) -> None:
+        """Mark a matched ASR segment index as consumed to prevent duplicate matches."""
+        for idx, seg in enumerate(asr_segments):
+            if seg is best_match:
+                self._matched_asr_indices.add(idx)
+                break
+
+    def _align_global(
         self,
         subtitles: list[SubtitleBlock],
         asr_segments: list[TranscriptionSegment],
-        window: float = WINDOW_SECONDS,
-        similarity_threshold: float = SIMILARITY_THRESHOLD,
+        window: float,
+        similarity_threshold: float,
     ) -> tuple[list[SubtitleBlock], list[AlignmentMatch]]:
-        """Align subtitles with ASR transcription.
-
-        For each subtitle, searches a local window for candidate ASR segments,
-        matches by Katakana similarity, and applies 3-tier timing adjustments.
-        Unmatched subtitles inherit shift offsets from neighbours.  Unmatched
-        ASR segments in blank gaps are inserted as new subtitle lines.
-
-        Args:
-            subtitles: List of parsed subtitle blocks.
-            asr_segments: List of ASR transcription segments.
-            window: Search window half-width in seconds (default ±5 min).
-            similarity_threshold: Minimum similarity ratio to accept a match.
-
-        Returns:
-            Tuple of ``(aligned_blocks, matches)`` where:
-            - ``aligned_blocks``: Updated SubtitleBlock list with adjusted
-              timestamps plus any inserted ASR segments.
-            - ``matches``: List of AlignmentMatch objects for logging.
-        """
+        """Perform full-phrase global phonetic alignment."""
         aligned_blocks: list[SubtitleBlock] = []
         matches: list[AlignmentMatch] = []
-
-        # Track shift offset propagation and matched ASR indices
-        self._last_shift_offset: Optional[float] = None
-        self._last_shift_asr: Optional[TranscriptionSegment] = None
-        matched_asr_indices: set[int] = set()
 
         for i, sub in enumerate(subtitles):
             new_block = SubtitleBlock(
@@ -332,47 +363,34 @@ class SubtitleAligner:
                 end_time=sub.end_time,
                 raw_text=sub.raw_text,
                 cleaned_text=sub.cleaned_text,
+                bom=sub.bom,
+                line_ending=sub.line_ending,
+                trailing_blank=sub.trailing_blank,
+                ass_header=sub.ass_header,
+                ass_metadata=sub.ass_metadata,
             )
 
             sub_kana = self._get_katakana(sub.cleaned_text)
             if not sub_kana:
                 aligned_blocks.append(new_block)
                 matches.append(
-                    AlignmentMatch(
-                        subtitle_index=i,
-                        asr_segment=None,
-                        similarity=0.0,
-                        timing_difference=0.0,
-                        action="keep",
-                        original_start=sub.start_time,
-                        original_end=sub.end_time,
-                        new_start=sub.start_time,
-                        new_end=sub.end_time,
+                    self._create_keep_match(
+                        i, sub, new_block.start_time, new_block.end_time
                     )
                 )
                 continue
 
             candidates = self._find_candidates(sub, asr_segments, window)
-
             if not candidates:
-                # No candidates in window — keep original timing
                 aligned_blocks.append(new_block)
                 matches.append(
-                    AlignmentMatch(
-                        subtitle_index=i,
-                        asr_segment=None,
-                        similarity=0.0,
-                        timing_difference=0.0,
-                        action="keep",
-                        original_start=sub.start_time,
-                        original_end=sub.end_time,
-                        new_start=sub.start_time,
-                        new_end=sub.end_time,
+                    self._create_keep_match(
+                        i, sub, new_block.start_time, new_block.end_time
                     )
                 )
                 continue
 
-            # Evaluate similarity for each candidate and pick the best
+            # Evaluate global similarity on candidate list
             best_match: Optional[TranscriptionSegment] = None
             best_score: float = -1.0
             for candidate in candidates:
@@ -385,42 +403,18 @@ class SubtitleAligner:
                     best_match = candidate
 
             if best_match is None or best_score < similarity_threshold:
-                # No good match — apply fallback offset if available
-                # and subtitle overlaps with a previously matched ASR region
-                fallback_offset = self._last_shift_offset
-                if (
-                    fallback_offset is not None
-                    and self._last_shift_asr is not None
-                    and self._subtitle_overlaps_matched_asr(sub)
-                ):
-                    new_start = sub.start_time + fallback_offset
-                    new_end = sub.end_time + fallback_offset
-                    logger.info(
-                        f"[Aligner] Subtitle {i + 1} unmatched (sim={best_score:.1%}) "
-                        f"shifted by fallback offset {fallback_offset:.2f}s"
-                    )
-                    new_block.start_time = new_start
-                    new_block.end_time = new_end
-                else:
-                    new_start, new_end = sub.start_time, sub.end_time
-
+                new_start, new_end = self._apply_fallback_offset(sub)
+                new_block.start_time = new_start
+                new_block.end_time = new_end
                 aligned_blocks.append(new_block)
                 matches.append(
-                    AlignmentMatch(
-                        subtitle_index=i,
-                        asr_segment=None,
-                        similarity=best_score if best_score >= 0 else 0.0,
-                        timing_difference=0.0,
-                        action="keep",
-                        original_start=sub.start_time,
-                        original_end=sub.end_time,
-                        new_start=new_start,
-                        new_end=new_end,
+                    self._create_keep_match(
+                        i, sub, new_start, new_end, max(best_score, 0.0)
                     )
                 )
                 continue
 
-            # Apply 3-tier timing adjustment
+            # Apply 3-tier global timing adjustments
             new_start, new_end, action = self._apply_timing_adjustment(
                 sub.start_time,
                 sub.end_time,
@@ -428,26 +422,13 @@ class SubtitleAligner:
                 best_match.end_time,
             )
 
+            # log the diff with the asr model
             diff = abs(sub.start_time - best_match.start_time)
-
-            # Track shift offset for fallback propagation (only "shift" action)
-            if action == "shift":
-                self._last_shift_offset = best_match.start_time - sub.start_time
-                self._last_shift_asr = best_match
-                logger.warning(
-                    f"[Aligner] Subtitle {i + 1} shifted by {diff:.2f}s "
-                    f"(similarity={best_score:.1%})"
-                )
-
-            # Record that this ASR segment was matched
-            for idx, seg in enumerate(asr_segments):
-                if seg is best_match:
-                    matched_asr_indices.add(idx)
-                    break
+            self._update_shift_state(action, sub, best_match, new_start)
+            self._mark_asr_consumed(best_match, asr_segments)
 
             new_block.start_time = new_start
             new_block.end_time = new_end
-
             aligned_blocks.append(new_block)
             matches.append(
                 AlignmentMatch(
@@ -463,16 +444,201 @@ class SubtitleAligner:
                 )
             )
 
-        # ── ASR insertion for unrecorded scenes ─────────────────────────
+        return aligned_blocks, matches
+
+    def _find_local_ctc_bounds(
+        self,
+        subtitle: SubtitleBlock,
+        candidate: TranscriptionSegment,
+        similarity_threshold: float,
+    ) -> tuple[float, float, float] | None:
+        """Find phonetic substring bounds inside an ASR segment using CTC.
+
+        Args:
+            subtitle: The subtitle block to match.
+            candidate: ASR segment containing character-level timings.
+            similarity_threshold: Minimum match ratio.
+
+        Returns:
+            Tuple of (new_start, new_end, similarity) or None if unmatched.
+        """
+        sub_text = subtitle.cleaned_text
+        asr_text = candidate.text
+
+        if not sub_text or not asr_text or not candidate.char_timings:
+            return None
+
+        matcher = difflib.SequenceMatcher(None, sub_text, asr_text)
+        matching_blocks = matcher.get_matching_blocks()
+
+        valid_blocks = [b for b in matching_blocks if b.size > 0]
+        if not valid_blocks:
+            return None
+
+        # Determine indices within ASR characters
+        match_start_idx = min(b.b for b in valid_blocks)
+        match_end_idx = max(b.b + b.size for b in valid_blocks)
+
+        match_end_idx = min(match_end_idx, len(candidate.char_timings) - 1)
+        if match_start_idx >= match_end_idx:
+            return None
+
+        matched_substring = asr_text[match_start_idx : match_end_idx + 1]
+        similarity = difflib.SequenceMatcher(None, sub_text, matched_substring).ratio()
+
+        if similarity < similarity_threshold:
+            return None
+
+        # Extract absolute timestamps via CTC
+        new_start = candidate.char_timings[match_start_idx]
+        new_end = candidate.char_timings[match_end_idx]
+
+        return new_start, new_end, similarity
+
+    def _align_local_ctc(
+        self,
+        subtitles: list[SubtitleBlock],
+        asr_segments: list[TranscriptionSegment],
+        window: float,
+        similarity_threshold: float,
+    ) -> tuple[list[SubtitleBlock], list[AlignmentMatch]]:
+        """Perform localized substring phonetic matching using CTC timings."""
+        aligned_blocks: list[SubtitleBlock] = []
+        matches: list[AlignmentMatch] = []
+
+        for i, sub in enumerate(subtitles):
+            new_block = SubtitleBlock(
+                start_time=sub.start_time,
+                end_time=sub.end_time,
+                raw_text=sub.raw_text,
+                cleaned_text=sub.cleaned_text,
+                bom=sub.bom,
+                line_ending=sub.line_ending,
+                trailing_blank=sub.trailing_blank,
+                ass_header=sub.ass_header,
+                ass_metadata=sub.ass_metadata,
+            )
+
+            sub_kana = self._get_katakana(sub.cleaned_text)
+            if not sub_kana:
+                aligned_blocks.append(new_block)
+                matches.append(
+                    self._create_keep_match(
+                        i, sub, new_block.start_time, new_block.end_time
+                    )
+                )
+                continue
+
+            candidates = self._find_candidates(sub, asr_segments, window)
+            if not candidates:
+                aligned_blocks.append(new_block)
+                matches.append(
+                    self._create_keep_match(
+                        i, sub, new_block.start_time, new_block.end_time
+                    )
+                )
+                continue
+
+            # Evaluate local matching on candidates
+            best_match: Optional[TranscriptionSegment] = None
+            best_score: float = -1.0
+            best_times: Optional[tuple[float, float]] = None
+
+            for candidate in candidates:
+                res = self._find_local_ctc_bounds(sub, candidate, similarity_threshold)
+                if res is not None:
+                    new_s, new_e, sim = res
+                    if sim > best_score:
+                        best_score = sim
+                        best_match = candidate
+                        best_times = (new_s, new_e)
+
+            if best_match is None or best_times is None:
+                new_start, new_end = self._apply_fallback_offset(sub)
+                new_block.start_time = new_start
+                new_block.end_time = new_end
+                aligned_blocks.append(new_block)
+                matches.append(
+                    self._create_keep_match(
+                        i, sub, new_start, new_end, max(best_score, 0.0)
+                    )
+                )
+                continue
+
+            # Apply 3-tier local timing adjustments using sub-segment bounds
+            new_start, new_end, action = self._apply_timing_adjustment(
+                sub.start_time,
+                sub.end_time,
+                best_times[0],
+                best_times[1],
+            )
+
+            self._update_shift_state(action, sub, best_match, new_start)
+            self._mark_asr_consumed(best_match, asr_segments)
+
+            new_block.start_time = new_start
+            new_block.end_time = new_end
+            aligned_blocks.append(new_block)
+            matches.append(
+                AlignmentMatch(
+                    subtitle_index=i,
+                    asr_segment=best_match,
+                    similarity=best_score,
+                    timing_difference=abs(sub.start_time - new_start),
+                    action=action,
+                    original_start=sub.start_time,
+                    original_end=sub.end_time,
+                    new_start=new_start,
+                    new_end=new_end,
+                )
+            )
+
+        return aligned_blocks, matches
+
+    # ── public API ──────────────────────────────────────────────────────
+
+    def align(
+        self,
+        subtitles: list[SubtitleBlock],
+        asr_segments: list[TranscriptionSegment],
+        window: float = WINDOW_SECONDS,
+        similarity_threshold: float = SIMILARITY_THRESHOLD,
+    ) -> tuple[list[SubtitleBlock], list[AlignmentMatch]]:
+        """Align subtitles with ASR transcription.
+
+        Routes logic dynamically to the configured alignment algorithm, executes
+        post-alignment scene insertions, and sorts results chronologically.
+
+        Args:
+            subtitles: List of parsed subtitle blocks.
+            asr_segments: List of ASR transcription segments.
+            window: Search window half-width in seconds (default ±5 min).
+            similarity_threshold: Minimum similarity ratio to accept a match.
+
+        Returns:
+            Tuple of ``(aligned_blocks, matches)``.
+        """
+        self._last_shift_offset = None
+        self._last_shift_asr = None
+        self._matched_asr_indices = set()
+
+        if self.mode == "global":
+            aligned_blocks, matches = self._align_global(
+                subtitles, asr_segments, window, similarity_threshold
+            )
+        elif self.mode == "local_ctc":
+            aligned_blocks, matches = self._align_local_ctc(
+                subtitles, asr_segments, window, similarity_threshold
+            )
+
         inserted_blocks, inserted_matches = self._insert_asr_scenes(
             aligned_blocks,
             asr_segments,
-            matched_asr_indices,
+            self._matched_asr_indices,
         )
         aligned_blocks.extend(inserted_blocks)
         matches.extend(inserted_matches)
 
-        # Sort final output by start time
         combined = list(zip(aligned_blocks, matches))
         combined.sort(key=lambda x: x[0].start_time)
         aligned_blocks = [b for b, _ in combined]

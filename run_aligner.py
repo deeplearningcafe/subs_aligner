@@ -80,6 +80,12 @@ def main() -> None:
         action="store_true",
         help="Run full alignment pipeline (audio + transcription + align).",
     )
+    parser.add_argument(
+        "--align-mode",
+        default="local_ctc",
+        choices=["local_ctc", "global"],
+        help="Device for audio processing (default: cpu).",
+    )
     args = parser.parse_args()
 
     # ── Audio processing mode ───────────────────────────────────────
@@ -183,7 +189,7 @@ def main() -> None:
 
         # Step 4: Align subtitles with ASR
         print("[Align] Running alignment engine...")
-        aligner = SubtitleAligner(device=args.device)
+        aligner = SubtitleAligner(device=args.device, mode=args.align_mode)
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
         # Summary

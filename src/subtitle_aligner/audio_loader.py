@@ -3,15 +3,13 @@ import subprocess
 import tempfile
 import torch
 import torchaudio
-from pydub import AudioSegment
 
 
 class AudioLoader:
     """Handles all audio and video ingestion for the project.
 
-    Converts media formats to standard WAV using ffmpeg (with a pydub
-    fallback), provides clean loading via torchaudio, and supports
-    direct audio extraction from video files.
+    Converts media formats to standard WAV using ffmpeg, provides clean loading
+    via torchaudio, and supports direct audio extraction from video files.
     """
 
     def __init__(self, file_path: str) -> None:
@@ -26,7 +24,11 @@ class AudioLoader:
     def _convert_to_wav(self, file_path: str) -> str:
         """Converts any audio/video file to a temporary WAV file using ffmpeg.
 
-        Falls back to pydub if ffmpeg is not available on the system.
+        Args:
+            file_path: Path to the source file.
+
+        Returns:
+            Path to the temporary wav file.
         """
         _, ext = os.path.splitext(file_path)
         if ext.lower() == ".wav":
@@ -37,7 +39,7 @@ class AudioLoader:
         temp_wav_path = temp_wav.name
         temp_wav.close()
 
-        # Try running ffmpeg to convert to 16-bit PCM WAV
+        # Run ffmpeg to convert to 16-bit PCM WAV
         cmd = [
             "ffmpeg",
             "-y",
@@ -49,19 +51,17 @@ class AudioLoader:
         ]
         try:
             subprocess.run(
-                cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-        except Exception as e:
-            # Fall back to pydub if ffmpeg fails or is missing
-            print(f"ffmpeg conversion failed: {e}. Falling back to pydub...")
-            try:
-                audio = AudioSegment.from_file(file_path)
-                audio.export(temp_wav_path, format="wav")
-            except Exception as pydub_err:
-                raise ValueError(
-                    f"Failed to convert {file_path} to WAV. "
-                    f"ffmpeg failed: {e}. pydub failed: {pydub_err}"
-                ) from pydub_err
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            raise RuntimeError(
+                f"Failed to convert {file_path} to WAV. "
+                "Ensure ffmpeg is installed and accessible in your PATH. "
+                f"Error: {e}"
+            ) from e
 
         return temp_wav_path
 
@@ -123,7 +123,15 @@ class AudioLoader:
             target_sr: Optional target sample rate.
             mono: If True, downmixes extracted audio to a single channel.
         """
-        cmd = ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "pcm_s16le"]
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+        ]
         if target_sr is not None:
             cmd.extend(["-ar", str(target_sr)])
         if mono:
@@ -132,7 +140,10 @@ class AudioLoader:
 
         try:
             subprocess.run(
-                cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         except subprocess.CalledProcessError as e:
             err_msg = e.stderr.decode("utf-8", errors="replace")

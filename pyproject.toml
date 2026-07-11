@@ -98,7 +98,6 @@ dependencies = [
   "propcache==0.5.2",
   "protobuf==7.35.1",
   "pycparser==3.0",
-  "pydub==0.25.1",
   "pykakasi==2.3.0",
   "pypinyin==0.44.0",
   "python-dateutil==2.9.0.post0",

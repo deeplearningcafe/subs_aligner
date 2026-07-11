@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from reazonspeech.espnet.asr import transcribe, audio_from_path
 from reazonspeech.espnet.asr.ctc import get_timings
+import torch
 
 from .text_processing import TextProcessor
 from .subtitle_writer import SubtitleWriter
+from .subtitle_parser import SubtitleBlock
 
 
 @dataclass
@@ -36,7 +38,7 @@ class ASRTranscriber:
     4. Normalizes all text to pure Katakana via ``TextProcessor``.
     """
 
-    def __init__(self, device: str = "cpu") -> None:
+    def __init__(self, device: str = "cpu", compute_ctc: bool = False) -> None:
         """Initialize the ASR transcriber.
 
         Args:
@@ -45,6 +47,7 @@ class ASRTranscriber:
         self.device = device
         self._model = None
         self._text_processor = TextProcessor()
+        self.compute_ctc = compute_ctc
 
     def _ensure_model(self):
         """Lazily load the ReazonSpeech model."""
@@ -74,44 +77,47 @@ class ASRTranscriber:
         self._ensure_model()
 
         audio = audio_from_path(audio_path)
-        result = transcribe(self._model, audio)
+        with torch.no_grad():
+            result = transcribe(self._model, audio)
 
-        samples = audio.waveform
+            samples = audio.waveform
 
-        segments: list[TranscriptionSegment] = []
-        for seg in result.segments:
-            absolute_start = seg.start_seconds + offset
-            absolute_end = seg.end_seconds + offset
-            katakana = self._text_processor.text_to_katakana(seg.text)
+            segments: list[TranscriptionSegment] = []
+            for seg in result.segments:
+                absolute_start = seg.start_seconds + offset
+                absolute_end = seg.end_seconds + offset
+                katakana = self._text_processor.text_to_katakana(seg.text)
 
-            # Compute CTC character timings relative to the segment
-            char_timings: list[float] = []
-            try:
-                # get_timings returns timings in audio samples
-                raw_timings = get_timings(self._model, samples, seg.text)
-                # to absolute seconds
-                char_timings = [
-                    (sample_idx / 16000.0) + offset for sample_idx in raw_timings
-                ]
-            except Exception as e:
-                # distribute timings uniformly
-                print(f"[ASR Warning] CTC alignment failed: {e}")
-                num_chars = len(seg.text)
-                if num_chars > 0:
-                    step = (absolute_end - absolute_start) / num_chars
-                    char_timings = [
-                        absolute_start + (i * step) for i in range(num_chars)
-                    ]
+                # Compute CTC character timings relative to the segment
+                char_timings: list[float] = []
+                if self.compute_ctc:
+                    try:
+                        # get_timings returns timings in audio samples
+                        raw_timings = get_timings(self._model, samples, seg.text)
+                        # to absolute seconds
+                        char_timings = [
+                            (sample_idx / 16000.0) + offset
+                            for sample_idx in raw_timings
+                        ]
+                    except Exception as e:
+                        # distribute timings uniformly
+                        print(f"[ASR Warning] CTC alignment failed: {e}")
+                        num_chars = len(seg.text)
+                        if num_chars > 0:
+                            step = (absolute_end - absolute_start) / num_chars
+                            char_timings = [
+                                absolute_start + (i * step) for i in range(num_chars)
+                            ]
 
-            segments.append(
-                TranscriptionSegment(
-                    start_time=absolute_start,
-                    end_time=absolute_end,
-                    text=seg.text,
-                    katakana=katakana,
-                    char_timings=char_timings,
+                segments.append(
+                    TranscriptionSegment(
+                        start_time=absolute_start,
+                        end_time=absolute_end,
+                        text=seg.text,
+                        katakana=katakana,
+                        char_timings=char_timings,
+                    )
                 )
-            )
 
         return segments
 
@@ -151,14 +157,21 @@ class ASRTranscriber:
         output_path: str | Path,
         fmt: str = "srt",
     ) -> None:
-        """Write aligned subtitle blocks to a file.
+        """Write transcribed ASR segments as subtitle blocks to a file.
 
         Args:
-            blocks: Aligned SubtitleBlock list.
+            blocks: List of TranscriptionSegment instances.
             output_path: Destination file path.
-            fmt: Output format — ``"srt"`` or ``"vtt"``.
+            fmt: Output format — "srt", "vtt", or "ass".
         """
-        # create raw_text for writter
-        for block in blocks:
-            setattr(block, "raw_text", block.text)
-        SubtitleWriter.write_blocks(blocks, output_path, fmt=fmt)
+
+        sub_blocks = [
+            SubtitleBlock(
+                start_time=seg.start_time,
+                end_time=seg.end_time,
+                raw_text=seg.text,
+                cleaned_text=self._text_processor.extract_main_text(seg.text),
+            )
+            for seg in blocks
+        ]
+        SubtitleWriter.write_blocks(sub_blocks, output_path, fmt=fmt)
