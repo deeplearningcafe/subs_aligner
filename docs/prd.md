@@ -1,119 +1,152 @@
-# Product Requirements Document (PRD): Automated Japanese Subtitle Alignment Tool
-
 ## Problem Statement
 
-As a student of the Japanese language utilizing a pitch-accent analysis application, the user suffers from frequently mistimed or shifted anime subtitles (`.srt` and `.vtt` formats). When subtitle timestamps do not accurately align with the actual spoken dialogue, downstream systems—such as pitch-accent extractors—fail to match audio to text correctly.
+Anime and video subtitles (in formats such as `.srt`, `.vtt`, and `.ass`) are frequently mistimed, drifted, or poorly aligned with spoken audio. This poses a major barrier for downstream natural language applications, such as extracting paired speech and text datasets for Text-to-Speech (TTS) and Automatic Speech Recognition (ASR) model training, or performing pitch-accent analysis.
 
-Manually correcting subtitle timing is extremely time-consuming. Additionally, automated alignment is historically difficult due to:
-- Minor variations and errors in speech recognition (ASR) systems.
-- Differences between video releases (e.g., television broadcasts containing sponsor blocks vs. clean Blu-ray releases with unrecorded or deleted scenes), leading to sudden, massive timing discrepancies (e.g., 10-second offsets).
-- Complex on-screen texts (e.g., signboard translations, opening/closing lyrics) where no spoken audio exists, which often get accidentally deleted or misaligned by traditional automatic aligners.
+Automated alignment is historically difficult due to:
+*   **ASR Hallucination**: Generative speech-to-text models (such as Whisper or ReazonSpeech) fabricate words during silent gaps, sound effects (SFX), or scenes with heavy background music (BGM).
+*   **One-to-Many Mappings**: Human-tailored subtitles split single spoken sentences into multiple short cards for readability, whereas ASR transcriptions output a single continuous block of text, leading to overlapping or collapsed boundaries.
+*   **Kanji Polyphony**: Standard G2P (Grapheme-to-Phoneme) conversion struggles with context-dependent Japanese readings (e.g., "私" pronounced as *watashi*, *watakushi*, or *atashi* depending on the character's personality/archetype).
+*   **Boundary Overestimation**: ASR segments often overshoot, leaving trailing silence at the end of subtitles. This degrades downstream TTS/ASR model training datasets where audio segments must be tightly cropped around active speech.
+
+---
 
 ## Solution
 
-The solution is a command-line utility structured under a modern `src` packaging layout that automatically aligns existing Japanese subtitle timestamps with video/audio speech, while guaranteeing the verbatim preservation of the original subtitle text, styles, and metadata.
+The solution is a multi-tiered, validation-driven alignment pipeline. Instead of relying on raw generative ASR timings, the pipeline uses ASR solely as a "rough container anchor" and applies a Japanese phonetic forced-alignment engine (`pydomino`) directly on the original subtitle text.
 
-The tool combines Ultimate Vocal Remover (UVR) vocal isolation, Silero Voice Activity Detection (VAD), and ReazonSpeech (espnet-asr) transcription. It resolves timeline shifts through a localized, segment-by-segment window search matching Katakana representations of original subtitles against ASR outputs. It splits long-form media at safe, cross-verified silent transitions to optimize memory, automatically inserts generated subtitles for unrecorded scenes, shifts unmatched text blocks based on neighboring offsets, and exports comprehensive, machine-parseable Markdown-table logs.
+The system leverages Voice Activity Detection (VAD) to filter hallucinations and establish speech boundaries. It implements a **Validation-Driven Dynamic Prompt Alignment Loop** that detects abnormal mora lengths (indicating alignment drift) and automatically attempts to resolve them. It corrects text-audio mismatches using localized phonetic searches against the ASR stream and a lightweight polyphony lookup dictionary. Finally, the tool exports synchronized subtitles with tight tail-trimmed endings (発音終了 + 100ms) and outputs highly detailed, parseable Markdown logs to support automated dataset cleaning.
 
 ---
 
 ## User Stories
 
-1. As a Japanese pitch-accent learner, I want my anime subtitles to be aligned within a fraction of a second to the actual spoken audio, so that my pitch-accent analysis tools work reliably.
-2. As a language student, I want to keep the exact verbatim text, formatting, font colors, and bracketed notes of my original subtitle file, so that I do not lose reading context or translation aids.
-3. As an automation developer, I want to pass my input video and subtitle directories dynamically via a command-line interface, so that I can integrate this system into batch scripts or a future graphical user interface.
-4. As a system operator, I want the output subtitles and logs to be saved predictably in designated output directories inside the repository, so that I can easily locate and review aligned files.
-5. As a developer, I want long video files to be partitioned into manageable chunks at natural pause points before transcribing them, so that I avoid out-of-memory errors on my hardware.
-6. As a developer, I want these partition points to be verified by both subtitle gaps and audio silence, so that the audio is never chopped in the middle of a spoken sentence.
-7. As an algorithm developer, I want minor timing errors (under 0.2s) to be left untouched, so that human-tailored subtitle reading buffers and lead times are not overwritten by noisy ASR boundaries.
-8. As a viewer watching a Blu-ray version with an extra scene, I want the aligner to detect this gap, insert new ASR-transcribed subtitles during the scene, and automatically shift the remaining original subtitles forward by the correct offset.
-9. As a viewer, I want signboard translations, quiet whispers, or theme lyrics without active speech detection to remain in the file and shift together with the local dialogue timeline, so that they do not get lost or misaligned.
-10. As a developer, I want the comparison engine to convert both subtitles and ASR text to standardized phonetic Katakana before matching, so that orthographic differences (Kanji vs. Kana, alternate spellings) do not break the alignment.
-11. As a data analyst, I want the execution logs to be output as strictly formatted Markdown tables, so that they are readable in my text editor while remaining trivial to parse into a CSV or spreadsheet format later.
-12. As a package maintainer, I want the entire application to reside within a standard `src/` layout, so that imports are structured reliably and do not conflict with the parent pitch-accent application.
+1. As a machine learning engineer, I want to extract tightly trimmed speech-text pairs from anime, so that I can train high-quality TTS and ASR models without silent buffers or trailing noise.
+2. As a language student, I want my aligned subtitles to drop off screen exactly 100 milliseconds after speech ends, so that the timing matches the physical rhythm of the dialogue.
+3. As an operator, I want unmatched ASR segments occurring during heavy music or action scenes to be classified as hallucinations and discarded, so that they do not generate false subtitles.
+4. As a developer, I want a single 5-minute physical audio segment to remain contiguous in memory, so that I do not suffer from complex file-handle management or timeline drift.
+5. As a developer, I want an ASR segment to be verified against logical VAD speech intervals before running phonetic alignment, so that silent lead-ins are pre-trimmed and consonant cutoffs are avoided via safeland buffers.
+6. As a viewer, when a single spoken line is split into three separate subtitle blocks, I want them to appear sequentially in perfect sync with the character's natural speech rate, rather than overlapping or appearing all at once.
+7. As an algorithm developer, if a dramatic pause stretches a mora beyond realistic speaking rates, I want the aligner to dynamically test inserting silence tokens (`pau`) before and after that mora to find the correct alignment path.
+8. As a developer, if a character contracts their speech (e.g., saying "けど" instead of "だけど" written in the subtitle), I want the system to detect this collapse and prune the unpronounced phonemes from the alignment prompt.
+9. As a developer, if a Kanji reading is converted incorrectly by G2P (e.g., a formal character pronouncing "私" as *watakushi* but G2P outputting *watashi*), I want the system to swap the G2P reading using a lightweight polyphony map and retry the alignment.
+10. As an operator, if a subtitle fails all phonetic alignment retries, I want the system to fall back to a linear timeline interpolation to keep the block safe from massive drifts, while logging the fallback event.
+11. As a user processing raw YouTube auto-generated subtitles, I want a dedicated flag (`--youtube-subs`) to ignore the original timestamps and rebuild human-readable, beautifully segmented subtitles from scratch using VAD boundaries and maximum line-length constraints.
+12. As a data analyst, I want the Markdown log file to include a "Method" column specifying how each segment was resolved, so that I can easily filter out fallback entries from my machine learning training pool.
 
 ---
 
 ## Implementation Decisions
 
-### 1. Repository & Package Architecture
-- **Packaging Standard**: The repository is structured using the standard Python `src/` layout. All active modules reside under `src/subtitle_aligner/` to support clean relative imports and packaging.
-- **Repository Outputs**: Output files and logs are saved to structured paths within the repository (`outputs/subtitles/` and `outputs/logs/`), while inputs are supplied dynamically as CLI parameters to decouple processing from static folders.
+### 1. Unified Pipeline Architecture
+The system will process input media in a linear, logical flow divided into several clean stages.
 
-### 2. Module Boundaries & Interfaces
+```
+[Video/Audio] ─> [UVR Vocals] ─> [5-Min Contiguous Chunking]
+                                           │
+                                           ▼
+[VAD Active Intervals] <── [VAD Post-Verification] ──> [ASR Decodes]
+                                           │
+                                           ▼
+                                [Rough Container Snap]
+                                           │
+                                           ▼
+                                [G2P Subtitle Phonemes]
+                                           │
+                                           ▼
+                           [pydomino Iterative Retries]
+                                           │
+                             (Success) ├──> [Tail Trim +100ms]
+                             (Failure) └──> [Linear Interpolation]
+                                           │
+                                           ▼
+                                 [Markdown Table Logs]
+```
 
-*   **Subtitle Parser** (`subtitle_parser.py`)
-    *   *Modification*: Reuses and extends the existing custom parser.
-    *   *Behavior*: Parses `.srt` and `.vtt` formats. Instead of returning a 3-tuple that strips text formatting, it outputs a list of 4-element structures containing: `(start_time, end_time, raw_text, cleaned_text)`.
-    *   *Data Preservation*: `raw_text` holds the exact, untouched string (preserving tags, font colors, brackets). `cleaned_text` stores the output of the text normalizer.
+### 2. Module Specifications
 
-*   **Audio Segmenter** (`audio_segmenter.py`)
-    *   *Behavior*: Extracts a clean vocal track via UVR and applies Silero VAD to identify spoken segments.
-    *   *Verification Split Logic*: Partitions the vocal audio into roughly 5-to-10 minute blocks at logical breaks.
-    *   *Matching Gap Evaluation*: To find a split boundary near a target time (e.g., 5 minutes):
-        1. It identifies a subtitle gap of $\ge 2.0$ seconds.
-        2. It searches a $\pm 30$-second audio search window around that gap.
-        3. If Silero VAD detects an actual silent gap of $\ge 1.0$ second in that window, it splits the audio at the midpoint.
-    *   *Edge Cases*:
-        *   *No Subtitle Gap*: If no subtitle gaps exist, it falls back to trusting the VAD silence detection entirely.
-        *   *No VAD Pause*: If noise/music obscures the audio silence, it falls back to splitting at the subtitle transition time.
+#### ASR Container Snapping & VAD Verification
+*   **VAD Pre-filtering (Chunking)**: The system continues to divide long media into 5-minute contiguous physical chunks at clean silent boundaries. No smaller physical files are generated.
+*   **VAD Post-verification**: For each segment returned by ASR, the system calculates the Voice Activity Ratio:
+    $$\text{VAD\_Ratio} = \frac{\text{Speech Duration within Segment}}{\text{Total Segment Duration}}$$
+    If this ratio is below a threshold (e.g., 25%), the ASR segment is flagged as a hallucination and discarded.
+*   **Speech Hypothesis Snapping**: For validated ASR segments, the system crops the boundaries to match the edges of overlapping VAD active intervals, adding a safe leading and trailing padding buffer of `150ms` to prevent cutting off weak starting/ending consonants (e.g., voiceless fricatives like *s*, *sh*, *h*).
 
-*   **ASR Transcriber** (`asr_transcriber.py`)
-    *   *Behavior*: Wraps ReazonSpeech (espnet-asr) execution. Transcribes the segmented audio blocks, tracks relative timings, and maps them back to absolute timelines by adding the segment start-time offset.
+#### Validation-Driven Dynamic Prompt Alignment Loop
+*   **Validation Thresholds**: The system monitors the output mora duration $D$ returned by `pydomino`.
+    *   Minimum duration $T_{\text{min}} = 30\text{ms}$ (approximately 3 audio frames).
+    *   Maximum duration $T_{\text{max}} = 350\text{ms}$ (excluding actual deliberate pauses).
+*   **Anomaly Correction Loop**:
+    1.  **Too Long ($D > T_{\text{max}}$)**: The system suspects an unannotated breath or dramatic pause. It generates two modified phoneme sequences: one with `pau` placed before the anomalous mora, and one with `pau` placed after. It runs `pydomino` on both and selects the sequence that minimizes the anomaly.
+    2.  **Too Short ($D < T_{\text{min}}$)**: The system suspects a contraction or deletion. It extracts the collapsed mora $M_k$ and its neighbors $M_{k-1}$ and $M_{k+1}$.
+        *   It searches the ASR phonetic stream. If $M_{k-1}$ and $M_{k+1}$ appear contiguously without $M_k$, $M_k$ is deleted from the sequence, and `pydomino` is re-run.
+        *   If there is a different phoneme $X$ between them, $M_k$ is replaced with $X$ and re-run.
+        *   If multiple matches occur, the search window expands to 4 neighboring moras to anchor the context.
+    3.  **Kanji Mismatch**: If the subtitle text matches the ASR text but the readings collapse, the system extracts the word and looks up alternative pronunciations using a static, domain-specific anime polyphony dictionary (e.g., `{"私": ["わたし", "あたし", "わたくし"]}`). It replaces the G2P output and re-runs `pydomino`.
+    4.  **Fallback**: If validation fails after 3 attempts, the system falls back to **Linear Timeline Interpolation** within the snapped container, mapping original subtitle timings to the adjusted container boundaries monotonically to guarantee zero overlaps.
 
-*   **Text Normalizer** (`text_normalizer.py`)
-    *   *Behavior*: Cleans input text via the existing custom `TextProcessor` (removing brackets, emojis, URLs, and applying `neologdn`). It then uses `pykakasi` to convert the normalized text to uniform Katakana, isolating phonetic moras for distance comparison.
+#### YouTube Subtitle Rebuilding Mode (`--youtube-subs`)
+*   If active, the system completely ignores the original subtitle timing cards.
+*   It merges the verified ASR stream and slices it into new subtitle segments based on VAD-detected silent intervals.
+*   It formats and splits the segments into readable cards respecting a maximum limit of 30 characters and a minimum display time of 1.0 second.
 
-*   **Aligner Core** (`aligner.py`)
-    *   *Behavior*: Matches original subtitles with ASR outputs row-by-row.
-    *   *Search Window*: Limits search candidate segments to a sliding temporal window of $\pm 5$ minutes around the subtitle's original timestamp.
-    *   *Similarity Evaluation*: Measures Katakana text similarity using a localized character ratio via `difflib.SequenceMatcher`.
-    *   *Decision Matrix*:
-        *   *Best Match $\ge 70\%$ Similarity*:
-            *   *Difference $< 0.2$ seconds*: Keep original timestamp (no change).
-            *   *Difference $0.2$ to $5.0$ seconds*: Adjust to the ASR segment timing.
-            *   *Difference $> 5.0$ seconds*: Apply the offset shift and record a log entry.
-        *   *Mismatch / No Match ($< 70\%$ Similarity)*:
-            *   If overlapping with another active ASR transcription of conflicting text, skip modification (keep original) to avoid corruption from multi-speaker overlaps.
-            *   If quiet (no overlapping speech), preserve the line and shift its timestamp by the last-known successful alignment offset to prevent it from drifting from the timeline.
-        *   *ASR Insertion (Unrecorded Scenes)*:
-            *   If an ASR segment remains unmatched after aligning all subtitles, and it sits in a silent subtitle gap, insert the transcribed text as a new subtitle line.
+#### Tail-Trimming
+*   The system sets the final subtitle card end time to:
+    $$\text{New\_End} = \min\left(T_{\text{speech\_end}} + 100\text{ms},\ S_{\text{next}}.\text{start\_time}\right)$$
+    where $T_{\text{speech\_end}}$ is the ending timestamp of the last non-`pau` phoneme spoken in that card as returned by `pydomino`.
 
-*   **Logger Writer** (`logger_writer.py`)
-    *   *Behavior*: Records summary stats and granular row modifications.
-    *   *Structure*: Follows a strict Markdown format. The modification sections are formatted as Markdown Tables using pipe delimiters (`|`), ensuring uniform column alignment so they can be easily parsed or converted to CSV via regex.
+### 3. Log Metadata Extension
+The `LoggerWriter` is updated to include an extra column, `Method`, in the `# 変更詳細 (Details)` Markdown table.
+
+| Column | Type | Description |
+|---|---|---|
+| `#` | Integer | 1-based subtitle card index |
+| `Action` | String | `keep`, `adjust`, `shift`, `inserted` |
+| `Method` | String | `pydomino-v1`, `pydomino-v2(pau)`, `pydomino-v2(pruned)`, `linear-fallback`, `youtube-rebuild` |
+| `Original Start (s)`| Float | Original starting time |
+| `Original End (s)` | Float | Original ending time |
+| `New Start (s)` | Float | Aligned starting time |
+| `New End (s)` | Float | Aligned ending time |
+| `Timing Diff (s)` | Float | Absolute starting offset |
+| `Similarity` | Float | Phonetic match confidence |
+| `Text` | String | Truncated subtitle text |
 
 ---
 
 ## Testing Decisions
 
-### Test Strategy
-Tests will prioritize **integration and behavior-driven assertions** over checking internal class implementations, ensuring refactoring can happen without breaking the test suite.
+### Test Strategy & Seams
+Tests must verify the external behavior of the alignment and correction loop rather than internal state transitions, ensuring refactoring can happen cleanly.
 
-### Key Testing Scenarios & Modules
-*   **Subtitle Parser Tests**:
-    *   Input a dirty `.srt` / `.vtt` file with rich text tags, emojis, and brackets.
-    *   Assert that the parser yields exact `raw_text` strings matching the file, and that formatting is preserved when writing back.
-*   **Hybrid Segmenter Tests**:
-    *   Verify that audio segment boundaries correctly fall inside silence regions when given synthetic audio with specific spoken segments and background music.
-*   **Aligner Core Tests**:
-    *   Test alignment using mock subtitle tracks shifted by small offsets ($0.1$s), medium offsets ($2$s), and large offsets containing a 10-second sponsor block.
-    *   Assert that small shifts remain unchanged, medium/large shifts are successfully aligned, and unmatched lines (like lyrics) preserve their relative timing via offset propagation.
-    *   Assert that unrecorded scenes successfully generate new subtitle blocks in the output.
-*   **Log Output Parser Validation**:
-    *   Run a mock execution, read the generated `.txt` log file, parse it with a quick python `split('|')` script, and assert that the columns are consistent and contain no malformed rows.
+The primary test seam is the **`SubtitleAligner.align()`** method. By passing controlled inputs (synthetic subtitle blocks, ASR segments with simulated drift, mock VAD active intervals, and mocked `pydomino` outputs), we can assert exact boundary snap calculations, prompt retry conditions, and fallback results.
+
+### Core Testing Scenarios
+1.  **VAD Hallucination Suppression Test**:
+    *   *Input*: An ASR segment placed in a region with 0% VAD overlap.
+    *   *Assertion*: Assert that the segment is discarded and no incorrect insertions or alignment shifts occur.
+2.  **One-to-Many Multi-Block Alignment Test**:
+    *   *Input*: 3 consecutive subtitle cards matched to 1 long ASR segment.
+    *   *Assertion*: Verify that `pydomino` correctly resolves individual boundaries, or that the system falls back to linear interpolation without any overlapping start/end times.
+3.  **Prompt-Tuning Loop Tests**:
+    *   *Too Long*: Input an abnormally long mora. Verify that `pydomino` runs again with `pau` inserted and recovers a normal mora length.
+    *   *Too Short/Contraction*: Input a subtitle with "だけど" where ASR contains "けど". Verify that the system identifies the collapse of "だ" via localized anchor search, prunes it, and successfully aligns.
+    *   *Polyphony Mismatch*: Input a subtitle with "私" (*watakushi*) where G2P defaulted to *watashi*. Verify that the alternative dictionary lookup replaces the reading and retries successfully.
+4.  **Tail Trim Precision Test**:
+    *   *Input*: A subtitle segment ending at 15.0s, but speech ends at 13.5s.
+    *   *Assertion*: Assert that the new end time is exactly 13.6s (13.5s + 100ms padding) and does not overlap the next card's start time.
+5.  **Log Parseability Test**:
+    *   *Action*: Execute a mock pipeline, parse the output Markdown table via pipe-splitting, and assert that the `Method` column is correctly populated and parseable.
 
 ---
 
 ## Out of Scope
 
-- **Graphical User Interface (GUI)**: This PRD covers only the command-line interface execution and its underlying core engine.
-- **Multilingual LLM Translation**: The translation capabilities inside the repository (e.g., Gemini-based translation in `translate.py`) are decoupled from this alignment feature.
-- **Real-Time / Streaming Subtitle Sync**: The alignment is designed purely for local file batch-processing.
+*   **Real-time streaming synchronization**: The alignment tool is strictly a batch-processing, local command-line utility.
+*   **Foreign Language Translation Alignment**: Subtitle parsing, normalisation, and G2P processing are tailored strictly for the Japanese phonology domain.
+*   **Acoustic Feature Extraction Tuning**: We do not retrain the underlying `pydomino` ONNX model weights; we only optimize the input phonetic sequence (G2P prompt tuning) and validate its output.
 
 ---
 
 ## Further Notes
 
-- **Morphological Dependencies**: The system relies on existing linguistic configurations within the repository (e.g., `pyopenjtalk` directories and dictionaries utilized by the pitch-accent app). Consolidated module placement prevents directory mapping conflicts.
-- **Hardware Profile**: ReazonSpeech processing is resource-intensive. The hybrid segmenter represents a critical performance safeguard, capping execution blocks to moderate durations (5-10 mins) to prevent CUDA or system memory depletion.
+*   **UVR Integration**: Running the UVR preprocessor is essential to obtain clean vocal stems. Heavy background music in action scenes degrades `pydomino`'s transition probability peaks; vocal isolation acts as a crucial accuracy safeguard.
+*   **High-Fidelity Dataset Filtering**: The inclusion of the `Method` column directly supports downstream ML operations. Developers can filter their output metadata to use only `pydomino-v1` and `pydomino-v2` segments for building extremely high-quality, noise-free datasets for text-to-speech model training.

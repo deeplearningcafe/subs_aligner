@@ -9,23 +9,7 @@ from pathlib import Path
 
 import pytest
 
-# Load logger_writer directly from file to avoid the __init__.py import chain
-# which pulls in aligner -> asr_transcriber -> reazonspeech (not installed).
-_test_root = Path(__file__).resolve().parent.parent
-_logger_path = _test_root / "subtitle_aligner" / "logger_writer.py"
-
-_spec = importlib.util.spec_from_file_location(
-    "subtitle_aligner.logger_writer", _logger_path
-)
-_logger_module = importlib.util.module_from_spec(_spec)
-sys.modules["subtitle_aligner.logger_writer"] = _logger_module
-_spec.loader.exec_module(_logger_module)
-
-LogEntry = _logger_module.LogEntry
-LogWarning = _logger_module.LogWarning
-LoggerWriter = _logger_module.LoggerWriter
-
-# ── fixtures ───────────────────────────────────────────────────────────
+from src.subtitle_aligner.logger_writer import LogEntry, LogWarning, LoggerWriter
 
 
 @pytest.fixture

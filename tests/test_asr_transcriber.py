@@ -75,11 +75,13 @@ class TestTranscriptionSegmentData:
             end_time=3.2,
             text="こんにちは",
             katakana="コンニチハ",
+            char_timings=[1.5, 1.8, 2.1, 2.4, 2.7],
         )
         assert seg.start_time == 1.5
         assert seg.end_time == 3.2
         assert seg.text == "こんにちは"
         assert seg.katakana == "コンニチハ"
+        assert seg.char_timings == [1.5, 1.8, 2.1, 2.4, 2.7]
 
 
 class TestKatakanaNormalization:
@@ -123,8 +125,13 @@ class TestTimestampMapping:
         mock_audio = MagicMock()
 
         with patch.object(transcriber, "_ensure_model"):
-            with patch.object(transcriber, "_audio_from_path", return_value=mock_audio):
-                with patch("reazonspeech.espnet.asr.transcribe") as mock_transcribe:
+            with patch(
+                "src.subtitle_aligner.asr_transcriber.audio_from_path",
+                return_value=mock_audio,
+            ):
+                with patch(
+                    "src.subtitle_aligner.asr_transcriber.transcribe"
+                ) as mock_transcribe:
                     mock_result = MagicMock()
                     mock_result.segments = [
                         MagicMock(
@@ -147,8 +154,13 @@ class TestTimestampMapping:
         mock_audio = MagicMock()
 
         with patch.object(transcriber, "_ensure_model"):
-            with patch.object(transcriber, "_audio_from_path", return_value=mock_audio):
-                with patch("reazonspeech.espnet.asr.transcribe") as mock_transcribe:
+            with patch(
+                "src.subtitle_aligner.asr_transcriber.audio_from_path",
+                return_value=mock_audio,
+            ):
+                with patch(
+                    "src.subtitle_aligner.asr_transcriber.transcribe"
+                ) as mock_transcribe:
                     mock_result = MagicMock()
                     mock_result.segments = [
                         MagicMock(
@@ -171,8 +183,13 @@ class TestTimestampMapping:
         mock_audio = MagicMock()
 
         with patch.object(transcriber, "_ensure_model"):
-            with patch.object(transcriber, "_audio_from_path", return_value=mock_audio):
-                with patch("reazonspeech.espnet.asr.transcribe") as mock_transcribe:
+            with patch(
+                "src.subtitle_aligner.asr_transcriber.audio_from_path",
+                return_value=mock_audio,
+            ):
+                with patch(
+                    "src.subtitle_aligner.asr_transcriber.transcribe"
+                ) as mock_transcribe:
                     mock_result = MagicMock()
                     mock_result.segments = [
                         MagicMock(start_seconds=0.1, end_seconds=0.8, text="あ"),
@@ -197,7 +214,9 @@ class TestTranscribeSegments:
         transcriber = ASRTranscriber()
 
         with patch.object(transcriber, "_ensure_model"):
-            with patch("reazonspeech.espnet.asr.transcribe") as mock_transcribe:
+            with patch(
+                "src.subtitle_aligner.asr_transcriber.transcribe"
+            ) as mock_transcribe:
                 mock_result = MagicMock()
                 mock_result.segments = [
                     MagicMock(
@@ -223,7 +242,9 @@ class TestTranscribeSegments:
             sr = 16000
             t = torch.linspace(0, 1.0, sr)
             torchaudio.save(
-                f.name, torch.sin(2 * torch.pi * 440 * t).unsqueeze(0) * 0.5, sr
+                f.name,
+                torch.sin(2 * torch.pi * 440 * t).unsqueeze(0) * 0.5,
+                sr,
             )
             seg_path = f.name
 
@@ -238,7 +259,9 @@ class TestTranscribeSegments:
 
         try:
             with patch.object(transcriber, "_ensure_model"):
-                with patch("reazonspeech.espnet.asr.transcribe") as mock_transcribe:
+                with patch(
+                    "src.subtitle_aligner.asr_transcriber.transcribe"
+                ) as mock_transcribe:
                     mock_result = MagicMock()
                     mock_result.segments = [
                         MagicMock(start_seconds=0.0, end_seconds=1.0, text="音声"),
@@ -247,9 +270,7 @@ class TestTranscribeSegments:
 
                     all_segments = transcriber.transcribe_segments(segments)
 
-                    # Should be a flat list of 2 (one per input segment)
                     assert len(all_segments) == 2
-                    # First starts at 0.0, second at 1.0 + 0.0 = 1.0
                     assert all_segments[0].start_time == pytest.approx(0.0)
                     assert all_segments[1].start_time == pytest.approx(1.0)
         finally:
@@ -265,8 +286,13 @@ class TestKatakanaInTranscriptionOutput:
         mock_audio = MagicMock()
 
         with patch.object(transcriber, "_ensure_model"):
-            with patch.object(transcriber, "_audio_from_path", return_value=mock_audio):
-                with patch("reazonspeech.espnet.asr.transcribe") as mock_transcribe:
+            with patch(
+                "src.subtitle_aligner.asr_transcriber.audio_from_path",
+                return_value=mock_audio,
+            ):
+                with patch(
+                    "src.subtitle_aligner.asr_transcriber.transcribe"
+                ) as mock_transcribe:
                     mock_result = MagicMock()
                     mock_result.segments = [
                         MagicMock(
@@ -291,5 +317,4 @@ class TestKatakanaInTranscriptionOutput:
                             assert "\u30a0" <= ch <= "\u30ff", (
                                 f"Non-Katakana character '{ch}' in: {seg.katakana}"
                             )
-                        # No spaces
                         assert " " not in seg.katakana

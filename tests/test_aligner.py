@@ -55,18 +55,21 @@ def sample_asr_segments():
             end_time=8.1,
             text="こんにちは世界",
             katakana="コンニチワセカイ",
+            char_timings=[],
         ),
         TranscriptionSegment(
             start_time=600.3,  # +0.3s offset
             end_time=605.3,
             text="おはようございます",
             katakana="オハヨウゴザイマス",
+            char_timings=[],
         ),
         TranscriptionSegment(
             start_time=1205.0,  # +5.0s offset
             end_time=1208.0,
             text="ありがとう",
             katakana="アリガトウ",
+            char_timings=[],
         ),
     ]
 
@@ -80,18 +83,21 @@ def sample_asr_segments_large_shift():
             end_time=23.0,
             text="こんにちは世界",
             katakana="コンニチワセカイ",
+            char_timings=[],
         ),
         TranscriptionSegment(
             start_time=600.0,  # exact match
             end_time=605.0,
             text="おはようございます",
             katakana="オハヨウゴザイマス",
+            char_timings=[],
         ),
         TranscriptionSegment(
             start_time=1800.0,  # +600s offset (10 min)
             end_time=1803.0,
             text="ありがとう",
             katakana="アリガトウ",
+            char_timings=[],
         ),
     ]
 
@@ -135,18 +141,16 @@ class TestFindCandidates:
         self, aligner, sample_subtitles, sample_asr_segments
     ):
         """ASR segments outside ±5 min window are excluded."""
-        # Subtitle at 5.0s, window is [−295, 305]
-        # ASR segment at 1800.0s is outside this window
         sub = sample_subtitles[0]
         far_asr = TranscriptionSegment(
             start_time=1800.0,
             end_time=1803.0,
             text="far",
             katakana="ファール",
+            char_timings=[],
         )
         segments = sample_asr_segments + [far_asr]
         candidates = aligner._find_candidates(sub, segments)
-        # 5.0 ± 300 = [-295, 305]; 1800 is outside
         assert not any(c.start_time == 1800.0 for c in candidates)
 
     def test_window_boundary_inclusive(self, aligner, sample_subtitles):
@@ -158,6 +162,7 @@ class TestFindCandidates:
             end_time=boundary + 1,
             text="boundary",
             katakana="バウンダリ",
+            char_timings=[],
         )
         candidates = aligner._find_candidates(sub, [boundary_asr])
         assert len(candidates) == 1
@@ -170,6 +175,7 @@ class TestFindCandidates:
             end_time=10003.0,
             text="far",
             katakana="ファール",
+            char_timings=[],
         )
         candidates = aligner._find_candidates(sub, [far_asr])
         assert candidates == []
@@ -324,12 +330,12 @@ class TestAlign:
 
     def test_align_no_candidates(self, aligner, sample_subtitles):
         """Subtitles with no ASR candidates in window are kept unchanged."""
-        # ASR segment far away and too short to insert
         far_asr = TranscriptionSegment(
             start_time=50000.0,
-            end_time=50000.5,  # < 1s minimum duration → not inserted
+            end_time=50000.5,
             text="far",
             katakana="ファール",
+            char_timings=[],
         )
         aligned_blocks, matches = aligner.align(sample_subtitles, [far_asr])
 
@@ -340,16 +346,15 @@ class TestAlign:
 
     def test_align_similarity_threshold(self, aligner, sample_subtitles):
         """Subtitles with similarity below threshold are kept unchanged."""
-        # ASR segments with dissimilar text
         dissimilar_asr = TranscriptionSegment(
             start_time=5.0,
             end_time=8.0,
             text="全く別の言葉",
             katakana="マタクベツノコトバ",
+            char_timings=[],
         )
         aligned_blocks, matches = aligner.align(sample_subtitles, [dissimilar_asr])
 
-        # First subtitle should not match (low similarity)
         assert matches[0].action == "keep"
         assert matches[0].similarity < 0.70
 
@@ -459,7 +464,6 @@ class TestAlignWithRealSubtitle:
 
         assert len(subtitles) > 0
 
-        # Create mock ASR segments that align with the first subtitle
         first_sub = subtitles[0]
         mock_asr = [
             TranscriptionSegment(
@@ -467,6 +471,7 @@ class TestAlignWithRealSubtitle:
                 end_time=first_sub.end_time + 0.3,
                 text="こんにちは世界",
                 katakana="コンニチワセカイ",
+                char_timings=[],
             ),
         ]
 
@@ -474,13 +479,8 @@ class TestAlignWithRealSubtitle:
 
         assert len(aligned_blocks) == len(subtitles)
         assert len(matches) == len(subtitles)
-        # First subtitle should be adjusted (diff = 0.3s)
         assert matches[0].action == "adjust"
-        # Raw text preserved
         assert aligned_blocks[0].raw_text == subtitles[0].raw_text
-
-
-# ── Issue 6: Alignment Robustness ─────────────────────────────────────
 
 
 # ── Fallback Offset Propagation ───────────────────────────────────────
@@ -494,7 +494,7 @@ class TestFallbackOffsetPropagation:
         inherits the shift offset."""
         subtitles = [
             SubtitleBlock(5.0, 8.0, "コンニチワセカイ", "コンニチワセカイ"),
-            SubtitleBlock(26.0, 28.0, "オン画面", "オン画面"),  # overlaps ASR at 25-28
+            SubtitleBlock(26.0, 28.0, "オン画面", "オン画面"),
         ]
         asr_segments = [
             TranscriptionSegment(
@@ -502,23 +502,27 @@ class TestFallbackOffsetPropagation:
                 28.0,
                 "コンニチワセカイ",
                 "コンニチワセカイ",
+                char_timings=[],
             ),
-            TranscriptionSegment(30.0, 32.0, "別の言葉", "ベツノコトバ"),
+            TranscriptionSegment(
+                30.0,
+                32.0,
+                "別の言葉",
+                "ベツノコトバ",
+                char_timings=[],
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # After sorting by start time, find matches by original_start
         shifted = [m for m in matches if m.original_start == 5.0][0]
         kept = [m for m in matches if m.original_start == 26.0][0]
 
-        # First subtitle: large shift (>5s) with perfect similarity
         assert shifted.action == "shift"
         assert shifted.similarity == 1.0
         assert shifted.new_start == 25.0
 
-        # Second subtitle: unmatched but overlaps shifted ASR → shifted by same offset
         assert kept.action == "keep"
-        assert kept.new_start == 26.0 + (25.0 - 5.0)  # +20s
+        assert kept.new_start == 26.0 + (25.0 - 5.0)
         assert kept.new_end == 28.0 + 20.0
 
     def test_unmatched_no_shift_without_overlap(self, aligner):
@@ -528,14 +532,14 @@ class TestFallbackOffsetPropagation:
             SubtitleBlock(5000.0, 5003.0, "遠い場所", "トオイバショ"),
         ]
         asr_segments = [
-            TranscriptionSegment(25.0, 28.0, "こんにちは", "コンニチワ"),
+            TranscriptionSegment(
+                25.0, 28.0, "こんにちは", "コンニチワ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # First subtitle: shifted
         assert matches[0].action == "shift"
 
-        # Second subtitle: no overlap with shifted ASR → not shifted
         assert matches[1].action == "keep"
         assert aligned_blocks[1].start_time == 5000.0
         assert aligned_blocks[1].end_time == 5003.0
@@ -547,15 +551,15 @@ class TestFallbackOffsetPropagation:
             SubtitleBlock(10.0, 12.0, "オン画面", "オン画面"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),  # adjust
-            TranscriptionSegment(15.0, 17.0, "別の言葉", "ベツノコトバ"),
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(
+                15.0, 17.0, "別の言葉", "ベツノコトバ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # First subtitle: small shift (<5s) → adjust, no offset propagation
         assert matches[0].action == "adjust"
 
-        # Second subtitle: unmatched, but no shift offset to propagate
         assert matches[1].action == "keep"
         assert aligned_blocks[1].start_time == 10.0
         assert aligned_blocks[1].end_time == 12.0
@@ -563,19 +567,19 @@ class TestFallbackOffsetPropagation:
     def test_unmatched_earlier_than_shift_kept(self, aligner):
         """Unmatched subtitle before any shift match is not shifted."""
         subtitles = [
-            SubtitleBlock(5.0, 8.0, "オン画面", "オン画面"),  # no match
-            SubtitleBlock(25.0, 28.0, "こんにちは", "こんにちは"),  # shift
+            SubtitleBlock(5.0, 8.0, "オン画面", "オン画面"),
+            SubtitleBlock(25.0, 28.0, "こんにちは", "こんにちは"),
         ]
         asr_segments = [
-            TranscriptionSegment(50.0, 53.0, "こんにちは", "コンニチワ"),
+            TranscriptionSegment(
+                50.0, 53.0, "こんにちは", "コンニチワ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # First subtitle: no prior shift → kept
         assert matches[0].action == "keep"
         assert aligned_blocks[0].start_time == 5.0
 
-        # Second subtitle: shifted
         assert matches[1].action == "shift"
 
 
@@ -591,11 +595,12 @@ class TestConflictOverlapHandling:
             SubtitleBlock(10.0, 15.0, "話者Aのセリフ", "話者Aノセリフ"),
         ]
         asr_segments = [
-            TranscriptionSegment(11.0, 14.0, "話者Bのセリフ", "話者Bノセリフ"),
+            TranscriptionSegment(
+                11.0, 14.0, "話者Bのセリフ", "話者Bノセリフ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # Low similarity → keep original timing
         assert matches[0].action == "keep"
         assert matches[0].similarity < 0.70
         assert aligned_blocks[0].start_time == 10.0
@@ -607,11 +612,16 @@ class TestConflictOverlapHandling:
             SubtitleBlock(10.0, 15.0, "こんにちは世界", "こんにちは世界"),
         ]
         asr_segments = [
-            TranscriptionSegment(10.5, 15.5, "こんにちは世界", "コンニチワセカイ"),
+            TranscriptionSegment(
+                10.5,
+                15.5,
+                "こんにちは世界",
+                "コンニチワセカイ",
+                char_timings=[],
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # High similarity → adjust
         assert matches[0].action == "adjust"
         assert matches[0].similarity >= 0.70
         assert aligned_blocks[0].start_time == 10.5
@@ -624,23 +634,15 @@ class TestConflictOverlapHandling:
         ]
         asr_segments = [
             TranscriptionSegment(
-                11.0,
-                14.0,
-                "コンニチワ",
-                "コンニチワ",
-            ),  # matches sub 0
+                11.0, 14.0, "コンニチワ", "コンニチワ", char_timings=[]
+            ),
             TranscriptionSegment(
-                13.0,
-                16.0,
-                "コンニチワ",
-                "コンニチワ",
-            ),  # overlaps sub 1 but low similarity
+                13.0, 16.0, "コンニチワ", "コンニチワ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # Sub 0: high similarity → adjust
         assert matches[0].action == "adjust"
-        # Sub 1: overlaps ASR but low similarity → keep
         assert matches[1].action == "keep"
         assert matches[1].similarity < 0.70
 
@@ -658,22 +660,23 @@ class TestASRSceneInsertion:
             SubtitleBlock(30.0, 35.0, "ありがとう", "アリガトウ"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),  # matched
-            TranscriptionSegment(15.0, 18.0, "新しいシーン", "アタラシイシーン"),  # gap
-            TranscriptionSegment(30.5, 33.5, "ありがとう", "アリガトウ"),  # matched
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(
+                15.0, 18.0, "新しいシーン", "アタラシイシーン", char_timings=[]
+            ),
+            TranscriptionSegment(
+                30.5, 33.5, "ありがとう", "アリガトウ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # Should have 3 blocks (2 original adjusted + 1 inserted)
         assert len(aligned_blocks) == 3
 
-        # Check inserted block
         inserted = [b for b in aligned_blocks if b.raw_text == "新しいシーン"]
         assert len(inserted) == 1
         assert inserted[0].start_time == 15.0
         assert inserted[0].end_time == 18.0
 
-        # Check inserted match
         inserted_matches = [m for m in matches if m.action == "inserted"]
         assert len(inserted_matches) == 1
         assert inserted_matches[0].asr_segment.text == "新しいシーン"
@@ -682,8 +685,10 @@ class TestASRSceneInsertion:
         """Inserted subtitles use original ASR text, not Katakana."""
         subtitles = [SubtitleBlock(5.0, 8.0, "こんにちは", "こんにちは")]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),
-            TranscriptionSegment(20.0, 23.0, "日本語のセリフ", "ニホンゴノセリフ"),
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(
+                20.0, 23.0, "日本語のセリフ", "ニホンゴノセリフ", char_timings=[]
+            ),
         ]
         aligned_blocks, _ = aligner.align(subtitles, asr_segments)
 
@@ -698,12 +703,11 @@ class TestASRSceneInsertion:
             SubtitleBlock(5.0, 8.0, "こんにちは", "こんにちは"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),
-            TranscriptionSegment(15.0, 15.5, "短い", "ミジカイ"),  # 0.5s < 1.0s
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(15.0, 15.5, "短い", "ミジカイ", char_timings=[]),
         ]
         aligned_blocks, _ = aligner.align(subtitles, asr_segments)
 
-        # Only the original subtitle, no insertion
         assert len(aligned_blocks) == 1
 
     def test_asr_overlapping_subtitle_not_inserted(self, aligner):
@@ -712,12 +716,11 @@ class TestASRSceneInsertion:
             SubtitleBlock(5.0, 8.0, "こんにちは", "こんにちは"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),  # matched
-            TranscriptionSegment(6.0, 9.0, "被る言葉", "ヒタ루コトバ"),  # overlaps sub
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(6.0, 9.0, "被る言葉", "ヒタるコトバ", char_timings=[]),
         ]
         aligned_blocks, _ = aligner.align(subtitles, asr_segments)
 
-        # Only the original subtitle, no insertion (overlaps)
         assert len(aligned_blocks) == 1
 
     def test_multiple_insertions_in_same_gap(self, aligner):
@@ -727,15 +730,22 @@ class TestASRSceneInsertion:
             SubtitleBlock(50.0, 55.0, "ありがとう", "アリガトウ"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),
-            TranscriptionSegment(20.0, 22.0, "第一のセリフ", "ダイイチノセリフ"),
-            TranscriptionSegment(23.0, 25.0, "第二のセリフ", "ダイニノセリフ"),
-            TranscriptionSegment(26.0, 28.0, "第三のセリフ", "ダイサンノセリフ"),
-            TranscriptionSegment(50.5, 53.5, "ありがとう", "アリガトウ"),
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(
+                20.0, 22.0, "第一のセリフ", "ダイイチノセリフ", char_timings=[]
+            ),
+            TranscriptionSegment(
+                23.0, 25.0, "第二のセリフ", "ダイニノセリフ", char_timings=[]
+            ),
+            TranscriptionSegment(
+                26.0, 28.0, "第三のセリフ", "ダイサンノセリフ", char_timings=[]
+            ),
+            TranscriptionSegment(
+                50.5, 53.5, "ありがとう", "アリガトウ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
-        # 2 original + 3 inserted = 5 blocks
         assert len(aligned_blocks) == 5
         assert sum(1 for m in matches if m.action == "inserted") == 3
 
@@ -746,8 +756,10 @@ class TestASRSceneInsertion:
             SubtitleBlock(20.0, 23.0, "ありがとう", "アリガトウ"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),
-            TranscriptionSegment(20.5, 23.5, "ありがとう", "アリガトウ"),
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(
+                20.5, 23.5, "ありがとう", "アリガトウ", char_timings=[]
+            ),
         ]
         aligned_blocks, matches = aligner.align(subtitles, asr_segments)
 
@@ -761,9 +773,13 @@ class TestASRSceneInsertion:
             SubtitleBlock(5.0, 8.0, "こんにちは", "こんにちは"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),
-            TranscriptionSegment(30.5, 33.5, "ありがとう", "アリガトウ"),
-            TranscriptionSegment(15.0, 18.0, "中間のセリフ", "チュウカンノセリフ"),
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(
+                30.5, 33.5, "ありがとう", "アリガトウ", char_timings=[]
+            ),
+            TranscriptionSegment(
+                15.0, 18.0, "中間のセリフ", "チュウカンノセリフ", char_timings=[]
+            ),
         ]
         aligned_blocks, _ = aligner.align(subtitles, asr_segments)
 
@@ -776,8 +792,12 @@ class TestASRSceneInsertion:
             SubtitleBlock(10.0, 13.0, "こんにちは", "こんにちは"),
         ]
         asr_segments = [
-            TranscriptionSegment(1.0, 4.0, "オープニング", "オエーピンク"),
-            TranscriptionSegment(10.5, 12.5, "こんにちは", "コンニチワ"),
+            TranscriptionSegment(
+                1.0, 4.0, "オープニング", "オエーピンク", char_timings=[]
+            ),
+            TranscriptionSegment(
+                10.5, 12.5, "こんにちは", "コンニチワ", char_timings=[]
+            ),
         ]
         aligned_blocks, _ = aligner.align(subtitles, asr_segments)
 
@@ -791,11 +811,98 @@ class TestASRSceneInsertion:
             SubtitleBlock(5.0, 8.0, "こんにちは", "こんにちは"),
         ]
         asr_segments = [
-            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ"),
-            TranscriptionSegment(20.0, 23.0, "エンディング", "エンディンク"),
+            TranscriptionSegment(5.5, 8.5, "こんにちは", "コンニチワ", char_timings=[]),
+            TranscriptionSegment(
+                20.0, 23.0, "エンディング", "エンディンク", char_timings=[]
+            ),
         ]
         aligned_blocks, _ = aligner.align(subtitles, asr_segments)
 
         assert len(aligned_blocks) == 2
         inserted = [b for b in aligned_blocks if b.start_time == 20.0]
         assert len(inserted) == 1
+
+
+# ── Local CTC Alignment Tests ─────────────────────────────────────────
+
+
+class TestLocalCTCAlignment:
+    """Test localized substring phonetic matching using CTC timings.
+
+    Specifically targets `local_ctc` mode features and the matching engine's
+    ability to crop timelines precisely based on character positions.
+    """
+
+    def test_find_local_ctc_bounds_success(self, aligner):
+        """Verify successful CTC bounds extraction for matched substrings."""
+        sub = SubtitleBlock(
+            start_time=5.0,
+            end_time=8.0,
+            raw_text="こんにちは",
+            cleaned_text="こんにちは",
+        )
+        candidate = TranscriptionSegment(
+            start_time=10.0,
+            end_time=13.0,
+            text="こんにちは世界",
+            katakana="コンニチワセカイ",
+            char_timings=[10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 13.0],
+        )
+        res = aligner._find_local_ctc_bounds(
+            subtitle=sub,
+            candidate=candidate,
+            similarity_threshold=0.70,
+        )
+        assert res is not None
+        new_start, new_end, similarity = res
+        assert new_start == 10.0
+        assert new_end == 12.5
+        assert similarity == pytest.approx(10.0 / 11.0)
+
+    def test_find_local_ctc_bounds_low_similarity(self, aligner):
+        """Verify None is returned if similarity is below threshold."""
+        sub = SubtitleBlock(
+            start_time=5.0,
+            end_time=8.0,
+            raw_text="おやすみ",
+            cleaned_text="おやすみ",
+        )
+        candidate = TranscriptionSegment(
+            start_time=10.0,
+            end_time=13.0,
+            text="こんにちは世界",
+            katakana="コンニチワセカイ",
+            char_timings=[10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 13.0],
+        )
+        res = aligner._find_local_ctc_bounds(
+            subtitle=sub,
+            candidate=candidate,
+            similarity_threshold=0.70,
+        )
+        assert res is None
+
+    def test_align_local_ctc_mode(self, aligner):
+        """Verify that aligner in local_ctc mode routes and adjusts timings."""
+        aligner.mode = "local_ctc"
+        subtitles = [
+            SubtitleBlock(
+                start_time=5.0,
+                end_time=8.0,
+                raw_text="こんにちは",
+                cleaned_text="こんにちは",
+            )
+        ]
+        asr_segments = [
+            TranscriptionSegment(
+                start_time=10.0,
+                end_time=13.0,
+                text="こんにちは世界",
+                katakana="コンニチワセカイ",
+                char_timings=[10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 13.0],
+            )
+        ]
+        aligned_blocks, matches = aligner.align(subtitles, asr_segments)
+        assert len(aligned_blocks) == 1
+        assert matches[0].action == "adjust"
+        assert aligned_blocks[0].start_time == 10.0
+        assert aligned_blocks[0].end_time == 12.5
