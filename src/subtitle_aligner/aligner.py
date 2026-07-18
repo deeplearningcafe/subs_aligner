@@ -28,9 +28,12 @@ from pathlib import Path
 from typing import Optional
 
 from .subtitle_parser import SubtitleBlock
-from .subtitle_writer import SubtitleWriter
 from .text_processing import TextProcessor
 from .asr_transcriber import TranscriptionSegment
+from .japanese_aligner import JapaneseForcedAligner
+from .vad_verifier import VADVerifier
+from .audio_segmenter import AudioSegment
+from .audio_loader import AudioLoader
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +80,44 @@ class SubtitleAligner:
     """
 
     WINDOW_SECONDS: float = 300.0  # ±5 minutes
-    SIMILARITY_THRESHOLD: float = 0.70  # 70%
+    SIMILARITY_THRESHOLD: float = 0.80  # 70%
     SMALL_SHIFT_THRESHOLD: float = 0.2  # <0.2s: keep original
     LARGE_SHIFT_THRESHOLD: float = 5.0  # >5.0s: shift + log
     INSERTION_GAP_THRESHOLD: float = 2.0  # seconds: min gap edge tolerance
     MIN_ASR_DURATION: float = 1.0  # seconds: minimum ASR segment to insert
 
-    def __init__(self, device: str = "cpu", mode: str = "global") -> None:
-        """Initialize the aligner."""
+    def __init__(
+        self,
+        device: str = "cpu",
+        mode: str = "global",
+        model_path: str | None = None,
+        padding_seconds: float = 0.100,
+    ) -> None:
+        """Initialize the aligner.
+
+        Args:
+            device: Device for computation (cpu/cuda).
+            mode: Active alignment strategy ("local_ctc" or "global").
+            model_path: Optional path to the pydomino ONNX model file.
+        """
         self.device = device
         self.mode = mode
+        self.padding_seconds = padding_seconds
         self._text_processor = TextProcessor()
+        self._validator = VADVerifier()
         print(f"Using mode: {mode}")
+        self.jp_aligner = None
+
+        if self.mode == "local_ctc":
+            import os
+
+            m_path = model_path or os.getenv("ALIGNER_MODEL_PATH")
+            if not m_path:
+                m_path = "models/pydomino.onnx"
+            try:
+                self.jp_aligner = JapaneseForcedAligner(m_path, device=self.device)
+            except Exception as e:
+                logger.warning("Could not load pydomino forced aligner: %s", e)
 
     def _get_katakana(self, text: str) -> str:
         """Convert text to Katakana for phonetic comparison.
@@ -160,14 +189,27 @@ class SubtitleAligner:
             Tuple of ``(new_start, new_end, action)`` where ``action`` is
             one of ``"keep"``, ``"adjust"``, or ``"shift"``.
         """
-        diff = abs(original_start - asr_start)
+        diff_start = abs(original_start - asr_start)
+        diff_end = abs(original_end - asr_end)
 
-        if diff < self.SMALL_SHIFT_THRESHOLD:
-            return original_start, original_end, "keep"
-        elif diff <= self.LARGE_SHIFT_THRESHOLD:
-            return asr_start, asr_end, "adjust"
-        else:
-            return asr_start, asr_end, "shift"
+        start = original_start
+        end = original_end
+        action = "keep"
+        if diff_start > self.SMALL_SHIFT_THRESHOLD:
+            start = asr_start
+            action = "adjust"
+        elif diff_start >= self.LARGE_SHIFT_THRESHOLD:
+            start = asr_start
+            action = "shift"
+
+        if diff_end > self.SMALL_SHIFT_THRESHOLD:
+            end = asr_end
+            action = "adjust"
+        elif diff_end >= self.LARGE_SHIFT_THRESHOLD:
+            end = asr_end
+            action = "shift"
+
+        return start, end, action
 
     def _subtitle_overlaps_matched_asr(self, subtitle: SubtitleBlock) -> bool:
         """Check if a subtitle overlaps with the last matched ASR segment.
@@ -423,7 +465,11 @@ class SubtitleAligner:
             )
 
             # log the diff with the asr model
-            diff = abs(sub.start_time - best_match.start_time)
+            # TODO: log the start and end difference
+            diff = max(
+                abs(sub.start_time - best_match.start_time),
+                abs(sub.end_time - best_match.end_time),
+            )
             self._update_shift_state(action, sub, best_match, new_start)
             self._mark_asr_consumed(best_match, asr_segments)
 
@@ -501,10 +547,13 @@ class SubtitleAligner:
         asr_segments: list[TranscriptionSegment],
         window: float,
         similarity_threshold: float,
+        audio_segments: list[AudioSegment] | None = None,
+        vad_intervals: list[dict[str, float]] | None = None,
     ) -> tuple[list[SubtitleBlock], list[AlignmentMatch]]:
-        """Perform localized substring phonetic matching using CTC timings."""
+        """Perform localized substring phonetic matching using pydomino."""
         aligned_blocks: list[SubtitleBlock] = []
         matches: list[AlignmentMatch] = []
+        vad_list = vad_intervals or []
 
         for i, sub in enumerate(subtitles):
             new_block = SubtitleBlock(
@@ -539,19 +588,110 @@ class SubtitleAligner:
                 )
                 continue
 
-            # Evaluate local matching on candidates
             best_match: Optional[TranscriptionSegment] = None
             best_score: float = -1.0
             best_times: Optional[tuple[float, float]] = None
 
             for candidate in candidates:
-                res = self._find_local_ctc_bounds(sub, candidate, similarity_threshold)
-                if res is not None:
-                    new_s, new_e, sim = res
-                    if sim > best_score:
-                        best_score = sim
-                        best_match = candidate
-                        best_times = (new_s, new_e)
+                # Filter out hallucinations
+                if self._validator.is_hallucination(
+                    candidate.start_time,
+                    candidate.end_time,
+                    vad_list,
+                ):
+                    continue
+
+                score = difflib.SequenceMatcher(
+                    None, sub_kana, candidate.katakana
+                ).ratio()
+
+                if score >= similarity_threshold and score > best_score:
+                    # Snap and pad the candidate container bounds
+                    c_start, c_end = self._validator.snap_and_pad_segment(
+                        candidate.start_time,
+                        candidate.end_time,
+                        vad_list,
+                    )
+
+                    # TODO: the ctc is flawed, simple vad works better
+                    # the end times are completely broken +3 secs
+                    # segments are the subs ones, not the clean ones
+                    # from the asr+vad pred
+                    pydomino_aligned = False
+                    if audio_segments and self.jp_aligner:
+                        # search for segment containing corrected asr
+                        matching_seg = None
+                        for seg in audio_segments:
+                            seg_end = seg.start_time + seg.duration
+                            if (
+                                seg.start_time <= c_start + 0.1
+                                and c_end <= seg_end + 0.1
+                            ):
+                                matching_seg = seg
+                                break
+
+                        if matching_seg:
+                            try:
+                                loader = AudioLoader(matching_seg.filepath)
+                                waveform, sr = loader.load_torchaudio(
+                                    sampling_rate=16000,
+                                    mono=True,
+                                )
+                                # start:1.222, end:2.444(same); start:3.233, end:4.111 (latter); start:0.233, end:1.111 (prev)
+                                # asr_s:1.002, asr_e:3.111
+                                # algo:
+                                # rel_start = max(0.0, 1.002-1.222=-0.200)=0
+                                # rel_end = min(2.444, 3.111-1.222?) = 2.444?
+
+                                rel_start = max(
+                                    0.0,
+                                    c_start,
+                                )
+                                seg_end = (
+                                    matching_seg.start_time + matching_seg.duration
+                                )
+                                rel_end = min(
+                                    seg_end,
+                                    c_end,
+                                )
+
+                                start_sample = int(rel_start * sr)
+                                end_sample = int(rel_end * sr)
+                                # slide segment to get corrected asr
+                                slice_wf = waveform[:, start_sample:end_sample]
+
+                                offset = matching_seg.start_time + rel_start
+                                local_alignment = self.jp_aligner.align(
+                                    (slice_wf, sr), sub.cleaned_text
+                                )
+
+                                non_pau = [
+                                    p for p in local_alignment if p["char"] != "pau"
+                                ]
+                                if non_pau:
+                                    refined_start = non_pau[0]["start"] + offset
+                                    refined_end = non_pau[-1]["end"] + offset
+                                    # TODO: check if next sub would overlap if padding
+                                    padded_start = max(
+                                        0.0, refined_start - self.padding_seconds
+                                    )
+                                    padded_end = min(
+                                        seg_end, refined_end + self.padding_seconds
+                                    )
+
+                                    best_times = (padded_start, padded_end)
+                                    print(
+                                        f"VAD align {c_start, c_end} and pydomino {best_times}"
+                                    )
+                                    pydomino_aligned = True
+                            except Exception as e:
+                                logger.error("[pydomino] Refinement failed: %s", e)
+
+                    if not pydomino_aligned:
+                        best_times = (c_start, c_end)
+
+                    best_score = score
+                    best_match = candidate
 
             if best_match is None or best_times is None:
                 new_start, new_end = self._apply_fallback_offset(sub)
@@ -565,7 +705,6 @@ class SubtitleAligner:
                 )
                 continue
 
-            # Apply 3-tier local timing adjustments using sub-segment bounds
             new_start, new_end, action = self._apply_timing_adjustment(
                 sub.start_time,
                 sub.end_time,
@@ -595,32 +734,27 @@ class SubtitleAligner:
 
         return aligned_blocks, matches
 
-    # ── public API ──────────────────────────────────────────────────────
-
     def align(
         self,
         subtitles: list[SubtitleBlock],
         asr_segments: list[TranscriptionSegment],
         window: float = WINDOW_SECONDS,
         similarity_threshold: float = SIMILARITY_THRESHOLD,
+        audio_segments: list[AudioSegment] | None = None,
+        vad_intervals: list[dict[str, float]] | None = None,
     ) -> tuple[list[SubtitleBlock], list[AlignmentMatch]]:
         """Align subtitles with ASR transcription.
 
         Routes logic dynamically to the configured alignment algorithm, executes
         post-alignment scene insertions, and sorts results chronologically.
-
-        Args:
-            subtitles: List of parsed subtitle blocks.
-            asr_segments: List of ASR transcription segments.
-            window: Search window half-width in seconds (default ±5 min).
-            similarity_threshold: Minimum similarity ratio to accept a match.
-
-        Returns:
-            Tuple of ``(aligned_blocks, matches)``.
         """
         self._last_shift_offset = None
         self._last_shift_asr = None
         self._matched_asr_indices = set()
+
+        if vad_intervals is None and audio_segments is not None:
+            logger.info("[Align] Pre-computing active VAD intervals...")
+            vad_intervals = self._validator._get_absolute_vad_intervals(audio_segments)
 
         if self.mode == "global":
             aligned_blocks, matches = self._align_global(
@@ -628,7 +762,12 @@ class SubtitleAligner:
             )
         elif self.mode == "local_ctc":
             aligned_blocks, matches = self._align_local_ctc(
-                subtitles, asr_segments, window, similarity_threshold
+                subtitles,
+                asr_segments,
+                window,
+                similarity_threshold,
+                audio_segments=audio_segments,
+                vad_intervals=vad_intervals,
             )
 
         inserted_blocks, inserted_matches = self._insert_asr_scenes(
@@ -659,4 +798,5 @@ class SubtitleAligner:
             output_path: Destination file path.
             fmt: Output format — ``"srt"`` or ``"vtt"``.
         """
-        SubtitleWriter.write_blocks(blocks, output_path, fmt=fmt)
+        # SubtitleWriter.write_blocks(blocks, output_path, fmt=fmt)
+        pass

@@ -34,3 +34,4 @@ outputs/
 data/
 *.srt
 ReazonSpeech/
+.env

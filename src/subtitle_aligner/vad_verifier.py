@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+from silero_vad import load_silero_vad, get_speech_timestamps
+from .audio_loader import AudioLoader
+from .audio_segmenter import AudioSegment
 
 logger = logging.getLogger(__name__)
 
@@ -62,73 +65,105 @@ class VADVerifier:
 
         return speech_duration / segment_duration
 
-    def verify_segment(
+    def is_hallucination(
         self,
-        asr_start: float,
-        asr_end: float,
+        segment_start: float,
+        segment_end: float,
         vad_intervals: list[dict[str, float]],
+        threshold: float = 0.25,
     ) -> bool:
-        """Determine if the ASR segment contains sufficient speech.
+        """Verify if the ASR segment overlaps with VAD speech.
 
         Args:
-            asr_start: ASR segment start timestamp (seconds).
-            asr_end: ASR segment end timestamp (seconds).
-            vad_intervals: List of active speech intervals from VAD.
-
-        Returns:
-            True if VAD ratio meets or exceeds the threshold.
+            segment_start: ASR segment start timestamp.
+            segment_end: ASR segment end timestamp.
+            vad_intervals: List of active VAD intervals.
+            threshold: Minimum active speech ratio (default 25%).
         """
-        ratio = self.calculate_vad_ratio(asr_start, asr_end, vad_intervals)
-        is_valid = ratio >= self.min_vad_ratio
-        if not is_valid:
-            logger.warning(
-                "[VAD] Segment [%.2fs - %.2fs] discarded (ratio: %.2f < %.2f)",
-                asr_start,
-                asr_end,
-                ratio,
-                self.min_vad_ratio,
-            )
-        return is_valid
+        if not vad_intervals:
+            return True
+        overlap = 0.0
+        for val in vad_intervals:
+            s = max(segment_start, val["start"])
+            e = min(segment_end, val["end"])
+            if s < e:
+                overlap += e - s
+        total_duration = segment_end - segment_start
+        if total_duration <= 0:
+            return True
+        return (overlap / total_duration) < threshold
 
     def snap_and_pad_segment(
         self,
-        asr_start: float,
-        asr_end: float,
+        segment_start: float,
+        segment_end: float,
         vad_intervals: list[dict[str, float]],
     ) -> tuple[float, float]:
-        """Snap segment boundaries to overlapping VAD intervals and pad.
+        """Snap ASR boundaries to overlapping VAD speech and apply padding.
 
         Args:
-            asr_start: ASR segment start timestamp (seconds).
-            asr_end: ASR segment end timestamp (seconds).
-            vad_intervals: List of active speech intervals from VAD.
-
-        Returns:
-            A tuple of (padded_start, padded_end) representing optimized
-            container bounds.
+            segment_start: Raw ASR segment start time.
+            segment_end: Raw ASR segment end time.
+            vad_intervals: Active speech intervals.
         """
-        # Collect VAD intervals that have active overlap with the segment
+        # start:1.222, end:2.444(same); start:3.233, end:4.111 (latter); start:0.233, end:1.111 (prev)
+        # asr_s:1.002, asr_e:3.111
+        # algo:
+        # 1. max(s)=1.222, min(2.444) -> accepted
+        # 2. 3.233, 2.444 -> Rejected
+        # 3. 1.002, 1.111 -> accepted
+        # for the snap: s->1.002 & e->2.444
         overlapping = []
-        for interval in vad_intervals:
-            overlap_start = max(asr_start, interval["start"])
-            overlap_end = min(asr_end, interval["end"])
-            if overlap_start < overlap_end:
-                overlapping.append(interval)
+        for val in vad_intervals:
+            s = max(segment_start, val["start"])
+            e = min(segment_end, val["end"])
+            if s < e:
+                overlapping.append(val)
 
         if not overlapping:
-            # Fallback if no overlap is detected; retain original timestamps
-            return asr_start, asr_end
+            return segment_start, segment_end
 
-        # Snap exactly to the outer boundaries of the overlapping intervals
-        v_min_start = min(inter["start"] for inter in overlapping)
-        v_max_end = max(inter["end"] for inter in overlapping)
+        v_min_start = min(val["start"] for val in overlapping)
+        v_max_end = max(val["end"] for val in overlapping)
 
-        # Crop the start and end boundaries (prevent expanding past raw ASR)
-        snapped_start = max(asr_start, v_min_start)
-        snapped_end = min(asr_end, v_max_end)
+        snapped_start = max(segment_start, v_min_start)
+        snapped_end = min(segment_end, v_max_end)
 
-        # Apply safe padding buffer to protect starting and ending consonants
         padded_start = max(0.0, snapped_start - self.padding_seconds)
         padded_end = snapped_end + self.padding_seconds
 
         return padded_start, padded_end
+
+    def _get_absolute_vad_intervals(
+        self,
+        audio_segments: list[AudioSegment],
+    ) -> list[dict[str, float]]:
+        """Compute absolute VAD speech intervals across all segments."""
+
+        vad_model = load_silero_vad(onnx=True)
+        absolute_intervals = []
+
+        for seg in audio_segments:
+            loader = AudioLoader(seg.filepath)
+            waveform, sr = loader.load_torchaudio(
+                sampling_rate=16000,
+                mono=True,
+            )
+            waveform_1d = waveform.squeeze(0)
+
+            relative_ts = get_speech_timestamps(
+                waveform_1d,
+                vad_model,
+                sampling_rate=sr,
+                return_seconds=True,
+            )
+
+            for ts in relative_ts:
+                absolute_intervals.append(
+                    {
+                        "start": ts["start"] + seg.start_time,
+                        "end": ts["end"] + seg.start_time,
+                    }
+                )
+
+        return absolute_intervals

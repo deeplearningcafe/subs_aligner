@@ -190,7 +190,11 @@ def main() -> None:
         # Step 4: Align subtitles with ASR
         print("[Align] Running alignment engine...")
         aligner = SubtitleAligner(device=args.device, mode=args.align_mode)
-        aligned_blocks, matches = aligner.align(subtitles, asr_segments)
+        aligned_blocks, matches = aligner.align(
+            subtitles,
+            asr_segments,
+            audio_segments=segments,
+        )
 
         # Summary
         keep_count = sum(1 for m in matches if m.action == "keep")
@@ -204,7 +208,7 @@ def main() -> None:
         # Step 5: Write aligned output
         fmt = detect_format(subtitle_path)
         output_path = output_subtitles / subtitle_path.name
-        aligner.write_aligned(aligned_blocks, output_path, fmt=fmt)
+        SubtitleWriter.write_blocks(aligned_blocks, output_path, fmt=fmt)
         print(f"[Align]   -> Written aligned subtitles to {output_path}")
 
         # Step 6: Generate structured log file inside a folder per transcription
@@ -230,7 +234,7 @@ def main() -> None:
 
         # Step 7: Store the ASR prediction subtitles for debugging
         asr_sub_path = output_logs / f"asr_prediction.{fmt}"
-        transcriber.write_aligned(asr_segments, asr_sub_path, fmt)
+        SubtitleWriter.write_blocks(asr_segments, asr_sub_path, fmt)
         print(f"[Align]   -> Written ASR prediction subtitles to {asr_sub_path}")
         return
 

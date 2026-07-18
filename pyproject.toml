@@ -162,6 +162,8 @@ members = ["ReazonSpeech/pkg/espnet-asr"]
 [tool.uv.sources]
 espnet-model-zoo = { git = "https://github.com/espnet/espnet_model_zoo", rev = "8b7301923c1c529a126c86c16fc73ce356b94d62" }
 reazonspeech-espnet-asr = { workspace = true }
+pydomino = { git = "https://github.com/DwangoMediaVillage/pydomino" }
+
 
 [dependency-groups]
 dev = ["pytest>=9.1.1"]

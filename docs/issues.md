@@ -1,3 +1,7 @@
+Here is the complete set of detailed, tracer-bullet implementation tickets designed to guide an agent or developer through implementing the new high-resolution alignment pipeline.
+
+Each ticket represents a functional, end-to-end slice of behavior and contains precise technical thresholds and rules established during our session.
+
 ---
 
 # 01 — Core `pydomino` Integration & Japanese Phonetic Wrapper
@@ -121,4 +125,5 @@ An extended logger module that profiles how each subtitle segment was resolved i
     *   `pydomino-v2(pruned)`: Succeeded after trimming a collapsed/short mora.
     *   `linear-fallback`: Failed validation and fell back to Linear Interpolation.
     *   `youtube-rebuild`: Built from scratch via YouTube reconstruction mode.
+- [ ] Write tests to verify that the generated Markdown log tables can be parsed cleanly by splitting strings on the pipe separator (`|`), and assert that all rows have a consistent column count.
 - [ ] Write tests to verify that the generated Markdown log tables can be parsed cleanly by splitting strings on the pipe separator (`|`), and assert that all rows have a consistent column count.

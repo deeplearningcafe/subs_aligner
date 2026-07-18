@@ -54,8 +54,13 @@ class SubtitleWriter:
                 f"{SubtitleWriter._format_srt_ts(block.start_time)} --> "
                 f"{SubtitleWriter._format_srt_ts(block.end_time)}{line_ending}"
             )
-            # Normalize internal \\n to the original line ending style
-            raw = block.raw_text.replace("\n", line_ending)
+            # Support both SubtitleBlock (raw_text) and TranscriptionSegment (text)
+            raw_text = getattr(block, "raw_text", None)
+            if raw_text is None:
+                raw_text = getattr(block, "text", "")
+            if raw_text is None:
+                raw_text = ""
+            raw = raw_text.replace("\n", line_ending)
 
             if i < len(blocks) - 1:
                 # Between blocks: blank line
@@ -87,8 +92,13 @@ class SubtitleWriter:
                 f"{SubtitleWriter._format_vtt_ts(block.start_time)} --> "
                 f"{SubtitleWriter._format_vtt_ts(block.end_time)}{line_ending}"
             )
-            # Normalize internal \\n to the original line ending style
-            raw = block.raw_text.replace("\n", line_ending)
+
+            raw_text = getattr(block, "raw_text", None)
+            if raw_text is None:
+                raw_text = getattr(block, "text", "")
+            if raw_text is None:
+                raw_text = ""
+            raw = raw_text.replace("\n", line_ending)
 
             if i < len(blocks) - 1:
                 # Between blocks: blank line

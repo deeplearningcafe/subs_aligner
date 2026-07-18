@@ -5,6 +5,7 @@ This document tracks planned features, known bugs, and technical debt for the Ti
 ## 🐛 Bugs
 - **ASR hallucination**: The asr models can hallucinate transcribing text where there is only silence. So we must use the vad to check if there is some human speech there or not to filter this hallucinated transcriptions.
 - **Subtitles length**: The original subtitles might divide long sentences on several subtitles despite having no pause between them, the asr can not do this so it transcribes a long sentence, making the adjustment incorrect.
+- **Subtitles not mached**: Same as Subtitles length, we must divide the asr predictions using ctc such that short subs are correctly matched.
 
 ## ✨ Features
 

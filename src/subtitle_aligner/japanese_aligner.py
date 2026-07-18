@@ -6,7 +6,6 @@ import logging
 from pathlib import Path
 import numpy as np
 import torch
-import torchaudio
 from .audio_loader import AudioLoader
 
 try:
@@ -143,12 +142,14 @@ class JapaneseForcedAligner:
         """
         # Load audio from file path or unpack pre-loaded tuple
         if isinstance(audio, (str, Path)):
-            waveform, sr = torchaudio.load(str(audio))
+            loader = AudioLoader(audio)
+            waveform, sr = loader.load_torchaudio(
+                sampling_rate=16000,
+                mono=True,
+            )
         else:
+            # assume already mono and 16K sr
             waveform, sr = audio
-
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
 
         y = waveform.squeeze(0).numpy().astype(np.float32)
 
