@@ -11,9 +11,6 @@ build/
 .venv/
 venv/
 
-# uv
-uv.lock
-
 # IDE
 .idea/
 .vscode/
@@ -33,5 +30,6 @@ tests/fixtures/
 outputs/
 data/
 *.srt
+*.vtt
 ReazonSpeech/
 .env
