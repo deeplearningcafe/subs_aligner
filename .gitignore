@@ -24,12 +24,8 @@ Thumbs.db
 # Outputs (generated files)
 outputs/
 
-# Test fixtures (not tests themselves)
-tests/fixtures/
-
 outputs/
 data/
-*.srt
-*.vtt
 ReazonSpeech/
 .env
+models/
