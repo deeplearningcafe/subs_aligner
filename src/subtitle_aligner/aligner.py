@@ -85,6 +85,7 @@ class SubtitleAligner:
     LARGE_SHIFT_THRESHOLD: float = 5.0  # >5.0s: shift + log
     INSERTION_GAP_THRESHOLD: float = 2.0  # seconds: min gap edge tolerance
     MIN_ASR_DURATION: float = 1.0  # seconds: minimum ASR segment to insert
+    TAIL_PAD_SECONDS: float = 0.100
 
     def __init__(
         self,
@@ -388,6 +389,170 @@ class SubtitleAligner:
                 self._matched_asr_indices.add(idx)
                 break
 
+    def _find_best_local_phonetic_span(
+        self,
+        sub_kana: str,
+        asr_kana: str,
+        similarity_threshold: float = 0.75,
+    ) -> tuple[float, int, int] | None:
+        """Find the optimal fuzzy phonetic sub-span in an ASR transcription.
+
+        Performs bounded local alignment allowing small mora substitutions
+        or contractions (e.g. 'し' vs 'す') while rejecting low-similarity
+        matches.
+
+        Args:
+            sub_kana: Katakana representation of the subtitle card.
+            asr_kana: Katakana representation of the candidate ASR sentence.
+            similarity_threshold: Minimum local similarity ratio required.
+
+        Returns:
+            Tuple of (similarity, start_idx, end_idx) in asr_kana, or None.
+        """
+        sub_len = len(sub_kana)
+        asr_len = len(asr_kana)
+        if sub_len == 0 or asr_len == 0:
+            return None
+
+        # Direct containment shortcut for exact matches
+        if sub_kana in asr_kana:
+            idx = asr_kana.index(sub_kana)
+            return 1.0, idx, idx + sub_len
+
+        best_score = 0.0
+        best_span: tuple[int, int] | None = None
+
+        # Search window allowing +/- 2 moras variation for edits
+        min_w = max(1, sub_len - 2)
+        max_w = min(asr_len, sub_len + 2)
+
+        for w in range(min_w, max_w + 1):
+            for i in range(asr_len - w + 1):
+                candidate_slice = asr_kana[i : i + w]
+                score = difflib.SequenceMatcher(None, sub_kana, candidate_slice).ratio()
+
+                if score > best_score:
+                    best_score = score
+                    best_span = (i, i + w)
+
+        if best_span is not None and best_score >= similarity_threshold:
+            return best_score, best_span[0], best_span[1]
+
+        return None
+
+    def _align_asr_container_phonemes(
+        self,
+        candidate: TranscriptionSegment,
+        container_start: float,
+        container_end: float,
+        audio_segments: list[AudioSegment],
+    ) -> list[dict[str, float | str]] | None:
+        """Run pydomino once on the entire continuous ASR audio container.
+
+        Aligns the full ASR transcript over the VAD-sanitized audio window,
+        generating continuous, gapless phoneme timestamps for the sentence.
+
+        Args:
+            candidate: ASR segment being aligned.
+            container_start: VAD-sanitized speech start timestamp (seconds).
+            container_end: VAD-sanitized speech end timestamp (seconds).
+            audio_segments: Loaded physical audio segments.
+
+        Returns:
+            List of aligned non-pau phoneme timing dictionaries, or None.
+        """
+        if not self.jp_aligner or not audio_segments:
+            return None
+
+        # Find the physical chunk containing the continuous container
+        matching_seg: Optional[AudioSegment] = None
+        for seg in audio_segments:
+            seg_end = seg.start_time + seg.duration
+            if (
+                seg.start_time <= container_start + 0.200
+                and container_end <= seg_end + 0.200
+            ):
+                matching_seg = seg
+                break
+
+        if matching_seg is None:
+            return None
+
+        try:
+            loader = AudioLoader(matching_seg.filepath)
+            waveform, sr = loader.load_torchaudio(sampling_rate=16000, mono=True)
+
+            rel_start = max(0.0, container_start - matching_seg.start_time)
+            rel_end = min(
+                matching_seg.duration,
+                container_end - matching_seg.start_time,
+            )
+
+            start_sample = int(rel_start * sr)
+            end_sample = int(rel_end * sr)
+
+            if end_sample <= start_sample:
+                return None
+
+            slice_wf = waveform[:, start_sample:end_sample]
+            slice_offset = matching_seg.start_time + rel_start
+
+            # Align the full ASR sentence text
+            alignment = self.jp_aligner.align((slice_wf, sr), candidate.text)
+
+            non_pau: list[dict[str, float | str]] = []
+            for p in alignment:
+                if p["char"] != "pau":
+                    non_pau.append(
+                        {
+                            "char": p["char"],
+                            "start": float(p["start"]) + slice_offset,
+                            "end": float(p["end"]) + slice_offset,
+                        }
+                    )
+            return non_pau if non_pau else None
+        except Exception as err:
+            logger.debug("[pydomino] Full container alignment failed: %s", err)
+            return None
+
+    def _extract_mora_span_timings(
+        self,
+        k_start: int,
+        k_end: int,
+        asr_kana_len: int,
+        phonemes: list[dict[str, float | str]],
+        is_phrase_final: bool,
+    ) -> tuple[float, float]:
+        """Map Katakana mora indices to phoneme timestamps with zero bleed.
+
+        Args:
+            k_start: Starting mora index in the ASR Katakana sequence.
+            k_end: Ending mora index in the ASR Katakana sequence.
+            asr_kana_len: Total length of ASR Katakana string.
+            phonemes: Continuous phonemes from full-container alignment.
+            is_phrase_final: True if this card is the final card of the ASR.
+
+        Returns:
+            Tuple of (card_start_time, card_end_time) in absolute seconds.
+        """
+        num_ph = len(phonemes)
+        # Interpolate mora indices to phoneme indices
+        p_start_idx = int((k_start / asr_kana_len) * num_ph)
+        p_end_idx = int((k_end / asr_kana_len) * num_ph) - 1
+
+        p_start_idx = max(0, min(p_start_idx, num_ph - 1))
+        p_end_idx = max(p_start_idx, min(p_end_idx, num_ph - 1))
+
+        # Direct, unpadded acoustic boundary extraction
+        start_time = float(phonemes[p_start_idx]["start"])
+        end_time = float(phonemes[p_end_idx]["end"])
+
+        # Tail-trimming applied strictly to phrase-final cards
+        if is_phrase_final:
+            end_time += self.TAIL_PAD_SECONDS
+
+        return start_time, end_time
+
     def _align_global(
         self,
         subtitles: list[SubtitleBlock],
@@ -550,10 +715,26 @@ class SubtitleAligner:
         audio_segments: list[AudioSegment] | None = None,
         vad_intervals: list[dict[str, float]] | None = None,
     ) -> tuple[list[SubtitleBlock], list[AlignmentMatch]]:
-        """Perform localized substring phonetic matching using pydomino."""
+        """Partition continuous ASR containers into non-bleeding subtitle cards.
+
+        Args:
+            subtitles: Subtitle cards to be aligned.
+            asr_segments: Continuous ASR transcription blocks.
+            window: Temporal candidate search window in seconds.
+            similarity_threshold: Minimum local phonetic similarity.
+            audio_segments: Loaded audio chunk references.
+            vad_intervals: Validated voice activity intervals.
+
+        Returns:
+            Tuple of (aligned_blocks, match_details).
+        """
+
         aligned_blocks: list[SubtitleBlock] = []
         matches: list[AlignmentMatch] = []
         vad_list = vad_intervals or []
+
+        # Cache full container phoneme alignments to avoid redundant runs
+        container_phoneme_cache: dict[int, list[dict[str, float | str]]] = {}
 
         for i, sub in enumerate(subtitles):
             new_block = SubtitleBlock(
@@ -588,11 +769,12 @@ class SubtitleAligner:
                 )
                 continue
 
-            best_match: Optional[TranscriptionSegment] = None
+            best_candidate: Optional[TranscriptionSegment] = None
+            best_cand_idx: int = -1
             best_score: float = -1.0
-            best_times: Optional[tuple[float, float]] = None
+            best_span: Optional[tuple[int, int]] = None
 
-            for candidate in candidates:
+            for cand_idx, candidate in enumerate(candidates):
                 # Filter out hallucinations
                 if self._validator.is_hallucination(
                     candidate.start_time,
@@ -601,99 +783,20 @@ class SubtitleAligner:
                 ):
                     continue
 
-                score = difflib.SequenceMatcher(
-                    None, sub_kana, candidate.katakana
-                ).ratio()
+                res = self._find_best_local_phonetic_span(
+                    sub_kana, candidate.katakana, similarity_threshold
+                )
+                if res is None:
+                    continue
 
-                if score >= similarity_threshold and score > best_score:
-                    # Snap and pad the candidate container bounds
-                    c_start, c_end = self._validator.snap_and_pad_segment(
-                        candidate.start_time,
-                        candidate.end_time,
-                        vad_list,
-                    )
-
-                    # TODO: the ctc is flawed, simple vad works better
-                    # the end times are completely broken +3 secs
-                    # segments are the subs ones, not the clean ones
-                    # from the asr+vad pred
-                    pydomino_aligned = False
-                    if audio_segments and self.jp_aligner:
-                        # search for segment containing corrected asr
-                        matching_seg = None
-                        for seg in audio_segments:
-                            seg_end = seg.start_time + seg.duration
-                            if (
-                                seg.start_time <= c_start + 0.1
-                                and c_end <= seg_end + 0.1
-                            ):
-                                matching_seg = seg
-                                break
-
-                        if matching_seg:
-                            try:
-                                loader = AudioLoader(matching_seg.filepath)
-                                waveform, sr = loader.load_torchaudio(
-                                    sampling_rate=16000,
-                                    mono=True,
-                                )
-                                # start:1.222, end:2.444(same); start:3.233, end:4.111 (latter); start:0.233, end:1.111 (prev)
-                                # asr_s:1.002, asr_e:3.111
-                                # algo:
-                                # rel_start = max(0.0, 1.002-1.222=-0.200)=0
-                                # rel_end = min(2.444, 3.111-1.222?) = 2.444?
-
-                                rel_start = max(
-                                    0.0,
-                                    c_start,
-                                )
-                                seg_end = (
-                                    matching_seg.start_time + matching_seg.duration
-                                )
-                                rel_end = min(
-                                    seg_end,
-                                    c_end,
-                                )
-
-                                start_sample = int(rel_start * sr)
-                                end_sample = int(rel_end * sr)
-                                # slide segment to get corrected asr
-                                slice_wf = waveform[:, start_sample:end_sample]
-
-                                offset = matching_seg.start_time + rel_start
-                                local_alignment = self.jp_aligner.align(
-                                    (slice_wf, sr), sub.cleaned_text
-                                )
-
-                                non_pau = [
-                                    p for p in local_alignment if p["char"] != "pau"
-                                ]
-                                if non_pau:
-                                    refined_start = non_pau[0]["start"] + offset
-                                    refined_end = non_pau[-1]["end"] + offset
-                                    # TODO: check if next sub would overlap if padding
-                                    padded_start = max(
-                                        0.0, refined_start - self.padding_seconds
-                                    )
-                                    padded_end = min(
-                                        seg_end, refined_end + self.padding_seconds
-                                    )
-
-                                    best_times = (padded_start, padded_end)
-                                    print(
-                                        f"VAD align {c_start, c_end} and pydomino {best_times}"
-                                    )
-                                    pydomino_aligned = True
-                            except Exception as e:
-                                logger.error("[pydomino] Refinement failed: %s", e)
-
-                    if not pydomino_aligned:
-                        best_times = (c_start, c_end)
-
+                score, k_start, k_end = res
+                if score > best_score:
                     best_score = score
-                    best_match = candidate
+                    best_candidate = candidate
+                    best_cand_idx = cand_idx
+                    best_span = (k_start, k_end)
 
-            if best_match is None or best_times is None:
+            if best_candidate is None or best_span is None or best_cand_idx < 0:
                 new_start, new_end = self._apply_fallback_offset(sub)
                 new_block.start_time = new_start
                 new_block.end_time = new_end
@@ -705,15 +808,56 @@ class SubtitleAligner:
                 )
                 continue
 
-            new_start, new_end, action = self._apply_timing_adjustment(
-                sub.start_time,
-                sub.end_time,
-                best_times[0],
-                best_times[1],
+            c_start, c_end = self._validator.snap_and_pad_segment(
+                best_candidate.start_time,
+                best_candidate.end_time,
+                vad_list,
             )
 
-            self._update_shift_state(action, sub, best_match, new_start)
-            self._mark_asr_consumed(best_match, asr_segments)
+            # Lazy-compute pydomino alignment on full ASR container
+            if best_cand_idx not in container_phoneme_cache:
+                aligned_ph = None
+                if audio_segments and self.jp_aligner:
+                    aligned_ph = self._align_asr_container_phonemes(
+                        best_candidate, c_start, c_end, audio_segments
+                    )
+                if aligned_ph:
+                    container_phoneme_cache[best_cand_idx] = aligned_ph
+
+            cand_kana = best_candidate.katakana or self._get_katakana(
+                best_candidate.text
+            )
+            kana_len = max(1, len(cand_kana))
+            k_start, k_end = best_span
+            is_final = k_end >= (kana_len - 1)
+
+            # Partition using pydomino phonemes or CTC timings
+            if best_cand_idx in container_phoneme_cache:
+                phonemes = container_phoneme_cache[best_cand_idx]
+                p_start, p_end = self._extract_mora_span_timings(
+                    k_start, k_end, kana_len, phonemes, is_final
+                )
+            elif best_candidate.char_timings:
+                # Proportional character CTC fallback
+                num_ctc = len(best_candidate.char_timings)
+                c_s = max(0, min(int((k_start / kana_len) * num_ctc), num_ctc - 1))
+                c_e = max(c_s, min(int((k_end / kana_len) * num_ctc) - 1, num_ctc - 1))
+                p_start = best_candidate.char_timings[c_s]
+                p_end = best_candidate.char_timings[c_e]
+                if is_final:
+                    p_end += self.TAIL_PAD_SECONDS
+            else:
+                # Linear ratio fallback within snapped container
+                dur = c_end - c_start
+                p_start = c_start + (k_start / kana_len) * dur
+                p_end = c_start + (k_end / kana_len) * dur
+
+            new_start, new_end, action = self._apply_timing_adjustment(
+                sub.start_time, sub.end_time, p_start, p_end
+            )
+
+            self._update_shift_state(action, sub, best_candidate, new_start)
+            self._mark_asr_consumed(best_candidate, asr_segments)
 
             new_block.start_time = new_start
             new_block.end_time = new_end
@@ -721,7 +865,7 @@ class SubtitleAligner:
             matches.append(
                 AlignmentMatch(
                     subtitle_index=i,
-                    asr_segment=best_match,
+                    asr_segment=best_candidate,
                     similarity=best_score,
                     timing_difference=abs(sub.start_time - new_start),
                     action=action,
@@ -731,6 +875,16 @@ class SubtitleAligner:
                     new_end=new_end,
                 )
             )
+
+        # Monotonic safety clamp: prevent adjacent card collisions
+        for i in range(len(aligned_blocks) - 1):
+            if aligned_blocks[i].end_time > aligned_blocks[i + 1].start_time:
+                safe_end = max(
+                    aligned_blocks[i].start_time + 0.200,
+                    aligned_blocks[i + 1].start_time - 0.020,
+                )
+                aligned_blocks[i].end_time = safe_end
+                matches[i].new_end = safe_end
 
         return aligned_blocks, matches
 
